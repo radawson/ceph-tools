@@ -24,6 +24,7 @@ from datetime import datetime
 from pathlib import Path
 
 DEBUG = True
+VERSION = "1.0.1"
 
 def debug_print(message):
     """Print debug messages if DEBUG is enabled."""
@@ -57,7 +58,7 @@ class OSDMonitor:
     """Core OSD monitoring functionality - pure Python, no dependencies."""
     
     def __init__(self):
-        self.controller_dev = None
+        self.controllers = []  # Changed from single controller_dev
         self.controller_info = {}
         self.drives = {}
         self.osds = {}
@@ -67,57 +68,159 @@ class OSDMonitor:
         self.osd_perf = {}
         self.scan_timestamp = None
     
-    def find_raid_controller(self):
-        """Find the RAID controller device."""
-        debug_print("Looking for RAID controller...")
-        for i in range(20):
+    def find_raid_controllers(self):
+        """Find ALL RAID controller devices using multiple detection methods."""
+        debug_print("Looking for RAID controller(s)...")
+        
+        # Method 1: Check lspci for controllers (informational)
+        lspci_output = run_command(["lspci"], silent=True)
+        pci_controllers = []
+        if lspci_output:
+            for line in lspci_output.split('\n'):
+                if 'raid' in line.lower() or 'megaraid' in line.lower() or 'perc' in line.lower():
+                    pci_controllers.append(line.strip())
+                    debug_print(f"PCI: {line.strip()}")
+        
+        # Method 2: Scan /dev/sg* devices
+        controllers = []
+        
+        # Extend search range since some systems have many sg devices
+        for i in range(31):  # sg0-sg30
             sg_dev = f"/dev/sg{i}"
-            if os.path.exists(sg_dev):
-                info = run_command(["smartctl", "-i", sg_dev], is_json=False, silent=True)
-                if info and ('megaraid' in info.lower() or 'raid' in info.lower() or 'perc' in info.lower()):
-                    debug_print(f"Found RAID controller at {sg_dev}")
-                    return sg_dev
-        debug_print("No RAID controller found, defaulting to /dev/sg6")
-        return "/dev/sg6"
-    
-    def get_controller_info(self, controller_dev):
-        """Get RAID controller information."""
-        info = run_command(["smartctl", "-i", controller_dev], is_json=False, silent=True)
+            if not os.path.exists(sg_dev):
+                continue
+            
+            # First try: Direct smartctl query
+            info = run_command(["smartctl", "-i", sg_dev], is_json=False, silent=True)
+            
+            is_controller = False
+            controller_type = 'Unknown'
+            controller_model = 'Unknown'
+            
+            if info:
+                info_lower = info.lower()
+                
+                # Check for explicit controller indicators
+                if 'megaraid' in info_lower or 'perc' in info_lower or 'enclosure' in info_lower:
+                    is_controller = True
+                
+                # Parse model information
+                for line in info.split('\n'):
+                    line_lower = line.lower()
+                    if 'product' in line_lower or 'device model' in line_lower:
+                        if ':' in line:
+                            model = line.split(':', 1)[1].strip()
+                            controller_model = model
+                            
+                            # Identify specific Dell PERC models
+                            if 'h730' in model.lower():
+                                controller_type = 'PERC H730'
+                                is_controller = True
+                            elif 'h830' in model.lower():
+                                controller_type = 'PERC H830'
+                                is_controller = True
+                            elif 'h740' in model.lower():
+                                controller_type = 'PERC H740'
+                                is_controller = True
+                            elif 'h840' in model.lower():
+                                controller_type = 'PERC H840'
+                                is_controller = True
+                            elif 'perc' in model.lower():
+                                controller_type = 'PERC'
+                                is_controller = True
+                            elif 'megaraid' in model.lower() or 'lsi' in model.lower() or '3108' in model.lower():
+                                controller_type = 'MegaRAID/LSI'
+                                is_controller = True
+            
+            # Second try: Test if this device responds to megaraid commands
+            # This is important for controllers in RAID mode
+            if not is_controller:
+                test_result = run_command(
+                    ["smartctl", "-i", "-d", "megaraid,0", sg_dev],
+                    is_json=False,
+                    silent=True
+                )
+                
+                if test_result and 'serial' in test_result.lower():
+                    is_controller = True
+                    controller_type = 'MegaRAID/LSI'
+                    # Try to get more info about the controller
+                    if info:
+                        for line in info.split('\n'):
+                            if 'product' in line.lower() or 'device' in line.lower():
+                                if ':' in line:
+                                    controller_model = line.split(':', 1)[1].strip()
+                                    break
+                    debug_print(f"{sg_dev}: Responds to megaraid commands (controller access)")
+            
+            if is_controller:
+                controllers.append({
+                    'device': sg_dev,
+                    'type': controller_type,
+                    'model': controller_model,
+                    'index': i
+                })
+                debug_print(f"Found RAID controller at {sg_dev}: {controller_type} ({controller_model})")
         
-        controller_info = {
-            'device': controller_dev,
-            'type': 'Unknown',
-            'model': 'Unknown',
-            'scsi_host': 0,
-        }
+        # If no controllers found via sg scanning, but we saw them in lspci, try common locations
+        if not controllers and pci_controllers:
+            debug_print("Controllers detected in lspci but not via /dev/sg* - trying common locations...")
+            # Try common controller device locations
+            for i in [24, 25, 26, 27, 0, 1, 2]:
+                sg_dev = f"/dev/sg{i}"
+                if not os.path.exists(sg_dev):
+                    continue
+                
+                test_result = run_command(
+                    ["smartctl", "-i", "-d", "megaraid,0", sg_dev],
+                    is_json=False,
+                    silent=True
+                )
+                
+                if test_result and 'serial' in test_result.lower():
+                    debug_print(f"Found working controller access at {sg_dev}")
+                    controllers.append({
+                        'device': sg_dev,
+                        'type': 'MegaRAID/LSI',
+                        'model': 'MegaRAID Controller',
+                        'index': i
+                    })
         
-        if info:
-            for line in info.split('\n'):
-                if 'device model' in line.lower() or 'product' in line.lower():
-                    controller_info['model'] = line.split(':', 1)[1].strip()
-                if 'perc' in line.lower():
-                    controller_info['type'] = 'PERC'
-                elif 'megaraid' in line.lower() or 'lsi' in line.lower():
-                    controller_info['type'] = 'MegaRAID'
+        if not controllers:
+            debug_print("No RAID controllers found via any method")
+            debug_print(f"PCI controllers detected: {len(pci_controllers)}")
+            if pci_controllers:
+                debug_print("Controllers visible on PCI bus but not accessible")
+                debug_print("Defaulting to /dev/sg6 - may not work correctly")
+            else:
+                debug_print("No controllers detected, defaulting to /dev/sg6")
+            
+            controllers = [{
+                'device': '/dev/sg6',
+                'type': 'Unknown',
+                'model': 'Unknown',
+                'index': 6
+            }]
+        else:
+            debug_print(f"Total controllers found: {len(controllers)}")
         
-        try:
-            scsi_hosts = list(Path('/sys/class/scsi_host').glob('host*'))
-            if scsi_hosts:
-                controller_info['scsi_host'] = 0
-                debug_print(f"Found SCSI hosts: {[h.name for h in scsi_hosts]}")
-        except:
-            pass
-        
-        debug_print(f"Controller: {controller_info['model']} ({controller_info['type']})")
-        return controller_info
+        return controllers
     
     @staticmethod
-    def build_scsi_address_from_phy(phy_id, controller_info):
-        """Build SCSI address from PHY ID."""
-        host = controller_info.get('scsi_host', 0)
-        channel = 0
-        target = phy_id
-        lun = 0
+    def build_scsi_address_from_phy(phy_id, controller_index):
+        """
+        Build SCSI address from PHY ID.
+        For most RAID controllers: [Host:Channel:Target:LUN]
+        - Host: Controller index (0 for first, 1 for second, etc.)
+        - Channel: Usually 0
+        - Target: Usually equals PHY ID or slot number
+        - LUN: Usually 0
+        """
+        host = controller_index  # Use actual controller index
+        channel = 0  # Most controllers use channel 0
+        target = phy_id  # PHY ID typically maps to target
+        lun = 0  # Single LUN per drive
+        
         return f"{host}:{channel}:{target}:{lun}"
     
     @staticmethod
@@ -176,66 +279,79 @@ class OSDMonitor:
     
     def scan_physical_drives(self, progress_callback=None):
         """
-        Scan local RAID controller for ALL physical drives.
+        Scan ALL RAID controllers for physical drives.
         
         Args:
             progress_callback: Optional function(current, total, message) for progress updates
         
         Returns:
-            dict: {serial: {phy_id, serial, model, vendor, health_hw, smart_details, size, scsi_address}}
+            dict: {serial: {phy_id, serial, model, vendor, health_hw, smart_details, size, scsi_address, controller}}
         """
         drives = {}
-        total_slots = 32
+        slots_per_controller = 32
+        total_slots = len(self.controllers) * slots_per_controller
+        current_slot = 0
         
-        for phy_id in range(total_slots):
-            if progress_callback:
-                progress_callback(phy_id, total_slots, f"Scanning PHY {phy_id}")
+        for controller in self.controllers:
+            controller_dev = controller['device']
+            controller_type = controller['type']
+            controller_index = controller['index']
             
-            info = run_command(
-                ["smartctl", "-j", "-a", "-d", f"megaraid,{phy_id}", self.controller_dev],
-                is_json=True, 
-                silent=True
-            )
-
-            if info and 'serial_number' in info:
-                serial = info['serial_number']
-                model = info.get('model_name', info.get('model_family', 'Unknown'))
-                vendor = info.get('vendor', '')
-
-                if not vendor and model:
-                    vendor_match = re.match(r'^(\w+)', model)
-                    if vendor_match:
-                        vendor = vendor_match.group(1)
-
-                health_passed = info.get('smart_status', {}).get('passed', False)
-                smart_details = self.extract_smart_details(info)
+            debug_print(f"Scanning controller {controller_dev} ({controller_type})")
+            
+            for phy_id in range(slots_per_controller):
+                if progress_callback:
+                    progress_callback(current_slot, total_slots, 
+                                    f"Scanning {controller_dev} PHY {phy_id}")
+                current_slot += 1
                 
-                size = None
-                if 'user_capacity' in info:
-                    size_info = info['user_capacity']
-                    if isinstance(size_info, dict) and 'bytes' in size_info:
-                        size = self.format_size_bytes(size_info['bytes'])
-                
-                scsi_address = self.build_scsi_address_from_phy(phy_id, self.controller_info)
+                info = run_command(
+                    ["smartctl", "-j", "-a", "-d", f"megaraid,{phy_id}", controller_dev],
+                    is_json=True, 
+                    silent=True
+                )
 
-                drives[serial] = {
-                    'phy_id': phy_id,
-                    'serial': serial,
-                    'model': model,
-                    'vendor': vendor,
-                    'health_hw': 'OK' if health_passed else 'FAIL',
-                    'smart_details': smart_details,
-                    'current_device': None,
-                    'scsi_address': scsi_address,
-                    'size': size,
-                }
+                if info and 'serial_number' in info:
+                    serial = info['serial_number']
+                    model = info.get('model_name', info.get('model_family', 'Unknown'))
+                    vendor = info.get('vendor', '')
 
-                debug_print(f"PHY {phy_id}: {model} S/N:{serial} SCSI:{scsi_address} Size:{size or 'N/A'}")
+                    if not vendor and model:
+                        vendor_match = re.match(r'^(\w+)', model)
+                        if vendor_match:
+                            vendor = vendor_match.group(1)
+
+                    health_passed = info.get('smart_status', {}).get('passed', False)
+                    smart_details = self.extract_smart_details(info)
+                    
+                    size = None
+                    if 'user_capacity' in info:
+                        size_info = info['user_capacity']
+                        if isinstance(size_info, dict) and 'bytes' in size_info:
+                            size = self.format_size_bytes(size_info['bytes'])
+                    
+                    scsi_address = self.build_scsi_address_from_phy(phy_id, controller_index)
+
+                    drives[serial] = {
+                        'phy_id': phy_id,
+                        'serial': serial,
+                        'model': model,
+                        'vendor': vendor,
+                        'health_hw': 'OK' if health_passed else 'FAIL',
+                        'smart_details': smart_details,
+                        'current_device': None,
+                        'scsi_address': scsi_address,
+                        'size': size,
+                        'controller': controller_type,
+                        'controller_device': controller_dev,
+                    }
+
+                    debug_print(f"Controller {controller_dev} PHY {phy_id}: {model} S/N:{serial} SCSI:{scsi_address} Size:{size or 'N/A'}")
         
         if progress_callback:
             progress_callback(total_slots, total_slots, "Scan complete")
         
-        debug_print(f"Found {len(drives)} physical drives on RAID controller")
+        debug_print(f"Found {len(drives)} physical drives across {len(self.controllers)} controller(s)")
         return drives
     
     def map_drives_to_devices(self, drives):
@@ -376,7 +492,7 @@ class OSDMonitor:
 
             if osd_serial in drives:
                 osd_to_drive[osd_id] = osd_serial
-                debug_print(f"✓ OSD {osd_id} (on {hostname}): Matched to local drive")
+                debug_print(f"âœ“ OSD {osd_id} (on {hostname}): Matched to local drive")
                 debug_print(f"  Serial: {osd_serial}, PHY: {drives[osd_serial]['phy_id']}, "
                            f"Device: {drives[osd_serial].get('current_device', 'N/A')}")
             else:
@@ -447,11 +563,16 @@ class OSDMonitor:
         """
         self.scan_timestamp = datetime.now().isoformat()
         
-        # Find controller
-        self.controller_dev = self.find_raid_controller()
-        self.controller_info = self.get_controller_info(self.controller_dev)
+        # Find all controllers
+        self.controllers = self.find_raid_controllers()
         
-        # Scan physical drives
+        # Build controller info summary
+        self.controller_info = {
+            'count': len(self.controllers),
+            'controllers': self.controllers
+        }
+        
+        # Scan physical drives from all controllers
         self.drives = self.scan_physical_drives(progress_callback)
         if not self.drives:
             return None

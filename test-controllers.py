@@ -13,6 +13,8 @@ import subprocess
 import os
 import sys
 
+VERSION = "1.0.1"
+
 def run_command(command, silent=False):
     """Run a shell command and return output."""
     try:
@@ -31,12 +33,35 @@ def test_controllers():
     print("="*80)
     print()
     
-    print("Scanning for RAID controllers...")
+    # Method 1: Check lspci for controllers
+    print("Method 1: Checking PCI bus for RAID controllers...")
+    print()
+    lspci_output = run_command(["lspci"], silent=True)
+    pci_controllers = []
+    
+    if lspci_output:
+        for line in lspci_output.split('\n'):
+            if 'raid' in line.lower() or 'megaraid' in line.lower() or 'perc' in line.lower():
+                print(f"  PCI Device: {line.strip()}")
+                pci_controllers.append(line.strip())
+    
+    if pci_controllers:
+        print(f"\n✓ Found {len(pci_controllers)} RAID controller(s) on PCI bus")
+    else:
+        print("  No RAID controllers found on PCI bus")
+    
+    print()
+    print("="*80)
+    print()
+    
+    # Method 2: Scan /dev/sg* devices with smartctl
+    print("Method 2: Scanning /dev/sg* devices for controller access...")
     print()
     
     controllers = []
     
-    for i in range(20):
+    # Try up to sg30 since you have many devices
+    for i in range(31):
         sg_dev = f"/dev/sg{i}"
         
         if not os.path.exists(sg_dev):
@@ -53,12 +78,20 @@ def test_controllers():
         controller_type = "Unknown"
         controller_model = "Unknown"
         
+        # Look for RAID indicators in the output
+        info_lower = info.lower()
+        
+        # Check for explicit RAID controller indicators
+        if 'megaraid' in info_lower or 'perc' in info_lower:
+            is_raid = True
+        
+        # Also check device type
+        if 'enclosure' in info_lower or 'raid' in info_lower:
+            is_raid = True
+        
+        # Parse model information
         for line in info.split('\n'):
             line_lower = line.lower()
-            
-            # Check for RAID indicators
-            if 'megaraid' in line_lower or 'raid' in line_lower or 'perc' in line_lower:
-                is_raid = True
             
             # Extract model information
             if 'product' in line_lower or 'device model' in line_lower:
@@ -69,16 +102,22 @@ def test_controllers():
                     # Identify specific types
                     if 'h730' in model.lower():
                         controller_type = 'PERC H730'
+                        is_raid = True
                     elif 'h830' in model.lower():
                         controller_type = 'PERC H830'
+                        is_raid = True
                     elif 'h740' in model.lower():
                         controller_type = 'PERC H740'
+                        is_raid = True
                     elif 'h840' in model.lower():
                         controller_type = 'PERC H840'
+                        is_raid = True
                     elif 'perc' in model.lower():
                         controller_type = 'PERC (Unknown Model)'
-                    elif 'megaraid' in model.lower() or 'lsi' in model.lower():
+                        is_raid = True
+                    elif 'megaraid' in model.lower() or 'lsi' in model.lower() or '3108' in model.lower():
                         controller_type = 'MegaRAID/LSI'
+                        is_raid = True
         
         if is_raid:
             controllers.append({
@@ -94,12 +133,84 @@ def test_controllers():
             print(f"  Index: {i}")
             print()
     
+    if not controllers:
+        print("  No controllers found via /dev/sg* scanning")
+    
+    print()
+    print("="*80)
+    print()
+    
+    # Method 3: Try to find controller by testing megaraid access
+    print("Method 3: Testing MegaRAID driver access on /dev/sg* devices...")
+    print()
+    
+    working_controllers = []
+    
+    # If we found controllers via smartctl, test them
+    if controllers:
+        for ctrl in controllers:
+            sg_dev = ctrl['device']
+            # Try to access drive 0 through this controller
+            test_result = run_command(
+                ["smartctl", "-i", "-d", "megaraid,0", sg_dev],
+                silent=True
+            )
+            
+            if test_result and 'serial' in test_result.lower():
+                print(f"✓ {sg_dev} responds to megaraid commands")
+                working_controllers.append(ctrl)
+            else:
+                print(f"✗ {sg_dev} does not respond to megaraid commands")
+    
+    # If no controllers found yet, try common sg devices
+    if not working_controllers:
+        print("  Testing common /dev/sg devices for megaraid access...")
+        # Try sg24 (often controller) and a few others
+        test_devices = [24, 0, 1, 2, 25, 26, 27]
+        
+        for i in test_devices:
+            sg_dev = f"/dev/sg{i}"
+            if not os.path.exists(sg_dev):
+                continue
+                
+            test_result = run_command(
+                ["smartctl", "-i", "-d", "megaraid,0", sg_dev],
+                silent=True
+            )
+            
+            if test_result and 'serial' in test_result.lower():
+                print(f"  ✓ {sg_dev} responds to megaraid commands!")
+                
+                # Try to identify the controller
+                ctrl_info = run_command(["smartctl", "-i", sg_dev], silent=True)
+                controller_model = "Unknown"
+                controller_type = "MegaRAID/LSI"
+                
+                if ctrl_info:
+                    for line in ctrl_info.split('\n'):
+                        if 'product' in line.lower() or 'device model' in line.lower():
+                            if ':' in line:
+                                controller_model = line.split(':', 1)[1].strip()
+                
+                working_controllers.append({
+                    'device': sg_dev,
+                    'type': controller_type,
+                    'model': controller_model,
+                    'index': i
+                })
+    
+    print()
+    print("="*80)
+    
     print("="*80)
     print("SUMMARY")
     print("="*80)
     print()
     
-    if not controllers:
+    # Use working_controllers if we found any, otherwise fall back to controllers
+    final_controllers = working_controllers if working_controllers else controllers
+    
+    if not final_controllers and not pci_controllers:
         print("❌ No RAID controllers detected!")
         print()
         print("Possible reasons:")
@@ -113,10 +224,40 @@ def test_controllers():
         print("  - Check SCSI devices: ls -l /dev/sg*")
         return False
     
-    print(f"✓ Detected {len(controllers)} RAID controller(s)")
+    if pci_controllers and not final_controllers:
+        print("⚠️  PARTIAL DETECTION")
+        print()
+        print(f"✓ Found {len(pci_controllers)} controller(s) on PCI bus")
+        print("❌ Could not access controllers via /dev/sg* devices")
+        print()
+        print("This usually means:")
+        print("  1. Controllers are in RAID mode (drives presented directly)")
+        print("  2. Need to find the controller passthrough device")
+        print()
+        print("Controllers detected on PCI bus:")
+        for ctrl in pci_controllers:
+            print(f"  • {ctrl}")
+        print()
+        print("Next steps:")
+        print("  1. Try: sudo smartctl --scan")
+        print("  2. Check: ls -l /dev/megaraid_sas_ioctl_node")
+        print("  3. Test manual access: sudo smartctl -i -d megaraid,0 /dev/sgX")
+        print("     (try sg0, sg24, sg25, sg26, sg27)")
+        print()
+        
+        # Try to give specific device recommendations
+        print("Recommended test commands:")
+        for i in [24, 25, 26, 27, 0]:
+            sg_dev = f"/dev/sg{i}"
+            if os.path.exists(sg_dev):
+                print(f"  sudo smartctl -i -d megaraid,0 {sg_dev}")
+        
+        return False
+    
+    print(f"✓ Detected {len(final_controllers)} accessible RAID controller(s)")
     print()
     
-    for ctrl in controllers:
+    for ctrl in final_controllers:
         print(f"  {ctrl['device']}: {ctrl['type']}")
     
     print()
@@ -125,8 +266,8 @@ def test_controllers():
     print("="*80)
     print()
     
-    if len(controllers) == 1:
-        print("Your system has ONE RAID controller.")
+    if len(final_controllers) == 1:
+        print("Your system has ONE accessible RAID controller.")
         print()
         print("The upgraded scripts will:")
         print("  ✓ Work correctly with your single controller")
@@ -135,7 +276,7 @@ def test_controllers():
         print()
         print("No issues expected.")
     else:
-        print(f"Your system has MULTIPLE RAID controllers ({len(controllers)}).")
+        print(f"Your system has MULTIPLE accessible RAID controllers ({len(final_controllers)}).")
         print()
         print("The OLD scripts would:")
         print("  ❌ Only scan the first controller")
@@ -158,7 +299,7 @@ def test_controllers():
     
     total_drives = 0
     
-    for ctrl in controllers:
+    for ctrl in final_controllers:
         print(f"Testing {ctrl['device']} ({ctrl['type']})...")
         drives_found = 0
         
@@ -202,7 +343,7 @@ def test_controllers():
     print("="*80)
     print()
     
-    if len(controllers) > 1:
+    if len(final_controllers) > 1:
         print("1. UPGRADE RECOMMENDED - You have multiple controllers")
         print("   → Read MULTI_CONTROLLER_UPGRADE.md")
         print("   → Follow installation instructions")
@@ -211,7 +352,7 @@ def test_controllers():
         print("   → sudo ./check-osd-plain.py")
         print()
         print("3. Verify output shows all controllers:")
-        for ctrl in controllers:
+        for ctrl in final_controllers:
             print(f"   → Should see: {ctrl['device']}: {ctrl['type']}")
     else:
         print("1. Upgrade still beneficial:")

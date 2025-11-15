@@ -18,6 +18,8 @@ import json
 import csv
 from datetime import datetime
 
+VERSION = "1.0.1"
+
 # Import the core module
 try:
     from osd_core import OSDMonitor
@@ -39,9 +41,9 @@ def format_status(osd_id, osd_status, systemd_status):
     parts.append("in" if status.get('in', False) else "OUT")
     
     if systemd == 'active':
-        parts.append("✓")
+        parts.append("âœ“")
     elif systemd == 'inactive':
-        parts.append("✗")
+        parts.append("âœ—")
     else:
         parts.append("?")
     
@@ -72,6 +74,20 @@ def display_plain_output(data):
     osd_status = data['osd_status']
     systemd_status = data['systemd_status']
     osd_perf = data['osd_perf']
+    controller_info = data.get('controller', {})
+    
+    # Display controller information
+    print("\n" + "="*80)
+    print("RAID CONTROLLER INFORMATION")
+    print("="*80)
+    controllers = controller_info.get('controllers', [])
+    if controllers:
+        for ctrl in controllers:
+            print(f"  {ctrl['device']}: {ctrl['type']} - {ctrl['model']}")
+        print(f"\nTotal controllers: {len(controllers)}")
+    else:
+        print("  No controller information available")
+    print("="*80)
     
     # Build rows
     rows = []
@@ -100,15 +116,20 @@ def display_plain_output(data):
             model = model[:21] + "..."
         
         scsi_addr = drive.get('scsi_address') or 'N/A'
+        controller = drive.get('controller', 'Unknown')
+        if controller and len(controller) > 15:
+            controller = controller[:12] + "..."
+        
         smart = drive.get('smart_details', {})
         smart_health = format_smart_health(smart)
-        temp_str = f"{smart.get('temperature')}°C" if smart.get('temperature') else "N/A"
+        temp_str = f"{smart.get('temperature')}Â°C" if smart.get('temperature') else "N/A"
         age_str = OSDMonitor.format_age(smart.get('power_on_hours'))
         
         row = {
             'osd_id': str(osd_id) if osd_id else 'N/A',
             'status': status_str,
             'latency': latency_str,
+            'controller': controller,
             'scsi_addr': scsi_addr,
             'device': current_dev_str,
             'size': drive.get('size') or 'N/A',
@@ -141,16 +162,16 @@ def display_plain_output(data):
     rows.sort(key=sort_key)
     
     # Print header
-    print("\n" + "="*160)
+    print("\n" + "="*180)
     print("DRIVE INVENTORY & OSD STATUS")
-    print("="*160)
-    print("="*160)
+    print("="*180)
+    print("="*180)
     
-    header_fmt = "{:<6} | {:<13} | {:<7} | {:<11} | {:<14} | {:<7} | {:<5} | {:<20} | {:<5} | {:<15} | {:<5} | {:<5} | {:<24}"
-    print(header_fmt.format("OSD ID", "Status", "Latency", "SCSI Addr", "Current Device", 
+    header_fmt = "{:<6} | {:<13} | {:<7} | {:<15} | {:<11} | {:<14} | {:<7} | {:<5} | {:<20} | {:<5} | {:<15} | {:<5} | {:<5} | {:<24}"
+    print(header_fmt.format("OSD ID", "Status", "Latency", "Controller", "SCSI Addr", "Current Device", 
                            "Size", "PHY", "Serial Number", "HW", "SMART Health", 
                            "Temp", "Age", "Model"))
-    print("="*160)
+    print("="*180)
     
     # Print rows
     for row in rows:
@@ -158,6 +179,7 @@ def display_plain_output(data):
             row['osd_id'],
             row['status'],
             row['latency'],
+            row['controller'],
             row['scsi_addr'],
             row['device'],
             row['size'],
@@ -170,7 +192,7 @@ def display_plain_output(data):
             row['model']
         ))
     
-    print("="*160)
+    print("="*180)
     
     # Summary
     total_drives = len(drives)
@@ -181,10 +203,14 @@ def display_plain_output(data):
     osds_out = sum(1 for oid in osd_to_drive if not osd_status.get(oid, {}).get('in', True))
     systemd_active = sum(1 for oid in osd_to_drive if systemd_status.get(oid) == 'active')
     hw_failed = sum(1 for d in drives.values() if d['health_hw'] == 'FAIL')
-    drives_available = sum(1 for d in drives.values() if d.get('current_device') and not any(
-        osd_to_drive.get(oid) == s for oid in osd_to_drive for s in [serial] 
-        for serial in drives.keys()
-    ))
+    # Count drives that are mapped but not assigned to OSDs
+    drives_available = 0
+    for serial, drive in drives.items():
+        if drive.get('current_device'):
+            # Check if this drive is assigned to any OSD
+            is_assigned = any(osd_to_drive.get(oid) == serial for oid in osd_to_drive)
+            if not is_assigned:
+                drives_available += 1
     
     print(f"\nSummary:")
     print(f"  Physical drives: {total_drives}")
@@ -202,7 +228,7 @@ def display_plain_output(data):
     print("="*80)
     
     if issues['smart_problems']:
-        print("⚠️  URGENT: Drives with SMART errors (REPLACE IMMEDIATELY!):")
+        print("âš ï¸  URGENT: Drives with SMART errors (REPLACE IMMEDIATELY!):")
         for problem in issues['smart_problems']:
             drive = problem['drive']
             smart = drive['smart_details']
@@ -212,10 +238,10 @@ def display_plain_output(data):
                   f"Pending={smart.get('pending_sectors') or 0}, "
                   f"Uncorr={smart.get('uncorrectable') or 0}")
     else:
-        print("✓ No drives with SMART errors detected")
+        print("âœ“ No drives with SMART errors detected")
     
     if issues['high_latency']:
-        print(f"\n⚠️  OSDs with high latency (>100ms):")
+        print(f"\nâš ï¸  OSDs with high latency (>100ms):")
         for item in sorted(issues['high_latency'], key=lambda x: x['latency'], reverse=True)[:5]:
             drive = item['drive']
             age = OSDMonitor.format_age(drive['smart_details'].get('power_on_hours')) if drive else 'N/A'
@@ -230,10 +256,10 @@ def display_plain_output(data):
             print(f"  PHY {drive['phy_id']}: /dev/{drive['current_device']} - {drive['size']} - {drive['model']}")
             print(f"    Serial: {drive['serial']}, SCSI: {drive['scsi_address']}, "
                   f"Age: {OSDMonitor.format_age(drive['smart_details'].get('power_on_hours'))}, "
-                  f"Temp: {drive['smart_details'].get('temperature')}°C")
+                  f"Temp: {drive['smart_details'].get('temperature')}Â°C")
             print(f"    Command: sudo ceph-volume lvm create --data /dev/{drive['current_device']}")
     
-    print(f"\nStatus Legend: [up/DOWN] [in/OUT] [✓ active / ✗ inactive / ? unknown]")
+    print(f"\nStatus Legend: [up/DOWN] [in/OUT] [âœ“ active / âœ— inactive / ? unknown]")
     print(f"SCSI Address: [Host:Channel:Target:LUN] - Physical location on controller")
 
 def export_csv(data, filename=None):
@@ -301,7 +327,7 @@ def export_csv(data, filename=None):
                 smart.get('power_on_hours'),
             ])
     
-    print(f"✓ Exported to CSV: {filename}")
+    print(f"âœ“ Exported to CSV: {filename}")
     return filename
 
 def export_json(data, filename=None):
@@ -364,7 +390,7 @@ def export_json(data, filename=None):
     with open(filename, 'w') as f:
         json.dump(export_data, f, indent=2)
     
-    print(f"✓ Exported to JSON: {filename}")
+    print(f"âœ“ Exported to JSON: {filename}")
     return filename
 
 def main():
