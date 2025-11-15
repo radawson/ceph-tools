@@ -11,14 +11,14 @@ Usage:
     sudo python3 check-osd-plain.py --export-json
 """
 
+VERSION = "1.0.2"
+
 import sys
 import os
 import argparse
 import json
 import csv
 from datetime import datetime
-
-VERSION = "1.0.1"
 
 # Import the core module
 try:
@@ -244,8 +244,11 @@ def display_plain_output(data):
         print(f"\nâš ï¸  OSDs with high latency (>100ms):")
         for item in sorted(issues['high_latency'], key=lambda x: x['latency'], reverse=True)[:5]:
             drive = item['drive']
-            age = OSDMonitor.format_age(drive['smart_details'].get('power_on_hours')) if drive else 'N/A'
-            print(f"  OSD {item['osd_id']}: {item['latency']}ms (PHY {drive['phy_id']}, Age: {age})")
+            if drive:
+                age = OSDMonitor.format_age(drive['smart_details'].get('power_on_hours'))
+                print(f"  OSD {item['osd_id']}: {item['latency']}ms (PHY {drive['phy_id']}, Age: {age})")
+            else:
+                print(f"  OSD {item['osd_id']}: {item['latency']}ms (drive info not available)")
     
     if issues['available_drives']:
         print(f"\n" + "="*80)

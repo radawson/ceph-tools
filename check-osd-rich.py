@@ -12,6 +12,8 @@ Install dependencies:
     pip install rich pandas openpyxl
 """
 
+VERSION = "1.0.2"
+
 import sys
 import os
 import argparse
@@ -111,6 +113,23 @@ def display_rich_output(data):
     
     console = Console()
     
+    # Display controller information
+    controller_info = data.get('controller', {})
+    controllers = controller_info.get('controllers', [])
+    
+    if controllers:
+        controller_text = ""
+        for ctrl in controllers:
+            controller_text += f"[bold]{ctrl['device']}:[/bold] {ctrl['type']} - {ctrl['model']}\n"
+        controller_text += f"\n[bold]Total controllers:[/bold] {len(controllers)}"
+        
+        console.print(Panel(
+            controller_text.strip(),
+            title="🎛️  RAID Controllers",
+            border_style="cyan",
+            box=box.ROUNDED
+        ))
+    
     # Build DataFrame for easier manipulation
     if HAS_PANDAS:
         df = build_dataframe(data)
@@ -119,7 +138,7 @@ def display_rich_output(data):
     
     # Main table
     table = Table(
-        title="🖥️  Ceph OSD Drive Inventory & Status",
+        title="ðŸ–¥ï¸  Ceph OSD Drive Inventory & Status",
         box=box.ROUNDED,
         show_header=True,
         header_style="bold cyan",
@@ -131,6 +150,7 @@ def display_rich_output(data):
     table.add_column("OSD", justify="right", style="cyan", no_wrap=True)
     table.add_column("Status", justify="center", no_wrap=True)
     table.add_column("Latency", justify="right", no_wrap=True)
+    table.add_column("Controller", style="magenta", no_wrap=True)
     table.add_column("SCSI Addr", style="dim", no_wrap=True)
     table.add_column("Device", style="yellow", no_wrap=True)
     table.add_column("Size", justify="right", no_wrap=True)
@@ -183,9 +203,9 @@ def display_rich_output(data):
                 status_parts.append("[yellow]OUT[/yellow]")
             
             if systemd == 'active':
-                status_parts.append("[green]✓[/green]")
+                status_parts.append("[green]âœ“[/green]")
             elif systemd == 'inactive':
-                status_parts.append("[red]✗[/red]")
+                status_parts.append("[red]âœ—[/red]")
             else:
                 status_parts.append("[yellow]?[/yellow]")
         
@@ -242,11 +262,11 @@ def display_rich_output(data):
         temp = smart.get('temperature')
         if temp:
             if temp > 50:
-                temp_text = f"[red bold]{temp}°C[/red bold]"
+                temp_text = f"[red bold]{temp}Â°C[/red bold]"
             elif temp > 40:
-                temp_text = f"[yellow]{temp}°C[/yellow]"
+                temp_text = f"[yellow]{temp}Â°C[/yellow]"
             else:
-                temp_text = f"[green]{temp}°C[/green]"
+                temp_text = f"[green]{temp}Â°C[/green]"
         else:
             temp_text = "[dim]N/A[/dim]"
         
@@ -258,10 +278,16 @@ def display_rich_output(data):
         if len(model) > 24:
             model = model[:21] + "..."
         
+        # Format controller
+        controller = drive.get('controller', 'Unknown')
+        if len(controller) > 15:
+            controller = controller[:12] + "..."
+        
         table.add_row(
             osd_text,
             status_text,
             latency_text,
+            controller,
             drive.get('scsi_address', 'N/A'),
             device_text,
             drive.get('size', 'N/A'),
@@ -298,7 +324,7 @@ def display_rich_output(data):
     if temps:
         avg_temp = sum(temps) / len(temps)
         max_temp = max(temps)
-        temp_stats = f"[bold]Temp:[/bold] Avg {avg_temp:.1f}°C, Max {max_temp:.1f}°C"
+        temp_stats = f"[bold]Temp:[/bold] Avg {avg_temp:.1f}Â°C, Max {max_temp:.1f}Â°C"
     
     latency_stats = ""
     if latencies:
@@ -317,7 +343,7 @@ def display_rich_output(data):
     
     console.print(Panel(
         summary_text,
-        title="📊 Summary Statistics",
+        title="ðŸ“Š Summary Statistics",
         border_style="green",
         box=box.ROUNDED
     ))
@@ -327,42 +353,42 @@ def display_rich_output(data):
     alerts = []
     
     if issues['smart_problems']:
-        alerts.append(f"[red bold]⚠️  {len(issues['smart_problems'])} drive(s) with SMART errors - REPLACE IMMEDIATELY![/red bold]")
+        alerts.append(f"[red bold]âš ï¸  {len(issues['smart_problems'])} drive(s) with SMART errors - REPLACE IMMEDIATELY![/red bold]")
         for problem in issues['smart_problems']:
             drive = problem['drive']
             smart = drive['smart_details']
             osd_text = f"OSD {problem['osd_id']}" if problem['osd_id'] else "No OSD"
-            alerts.append(f"   • {osd_text} (PHY {drive['phy_id']}): "
+            alerts.append(f"   â€¢ {osd_text} (PHY {drive['phy_id']}): "
                          f"Realloc={smart.get('reallocated_sectors') or 0}, "
                          f"Pending={smart.get('pending_sectors') or 0}, "
                          f"Uncorr={smart.get('uncorrectable') or 0}")
     
     if issues['high_latency']:
-        alerts.append(f"\n[yellow]⚠️  {len(issues['high_latency'])} OSD(s) with high latency (>100ms):[/yellow]")
+        alerts.append(f"\n[yellow]âš ï¸  {len(issues['high_latency'])} OSD(s) with high latency (>100ms):[/yellow]")
         for item in sorted(issues['high_latency'], key=lambda x: x['latency'], reverse=True)[:5]:
             drive = item['drive']
             age = OSDMonitor.format_age(drive['smart_details'].get('power_on_hours')) if drive else 'N/A'
-            alerts.append(f"   • OSD {item['osd_id']}: {item['latency']}ms "
+            alerts.append(f"   â€¢ OSD {item['osd_id']}: {item['latency']}ms "
                          f"(PHY {drive['phy_id']}, Age: {age})")
     
     if issues['high_temp']:
-        alerts.append(f"\n[yellow]⚠️  {len(issues['high_temp'])} drive(s) running hot (>45°C):[/yellow]")
+        alerts.append(f"\n[yellow]âš ï¸  {len(issues['high_temp'])} drive(s) running hot (>45Â°C):[/yellow]")
         for item in issues['high_temp'][:5]:
             drive = item['drive']
             osd_text = f"OSD {item['osd_id']}" if item['osd_id'] else "No OSD"
-            alerts.append(f"   • {osd_text} (PHY {drive['phy_id']}): {item['temperature']}°C")
+            alerts.append(f"   â€¢ {osd_text} (PHY {drive['phy_id']}): {item['temperature']}Â°C")
     
     if alerts:
         console.print(Panel(
             "\n".join(alerts),
-            title="⚠️  Alerts & Recommendations",
+            title="âš ï¸  Alerts & Recommendations",
             border_style="red",
             box=box.HEAVY
         ))
     else:
         console.print(Panel(
-            "[green bold]✓ No critical issues detected[/green bold]",
-            title="✓ System Health",
+            "[green bold]âœ“ No critical issues detected[/green bold]",
+            title="âœ“ System Health",
             border_style="green",
             box=box.ROUNDED
         ))
@@ -380,12 +406,12 @@ def export_data(df, base_filename='osd_status'):
     # CSV export
     csv_file = f"{base_filename}_{timestamp}.csv"
     df.to_csv(csv_file, index=False)
-    print(f"✓ Exported to CSV: {csv_file}")
+    print(f"âœ“ Exported to CSV: {csv_file}")
     
     # JSON export
     json_file = f"{base_filename}_{timestamp}.json"
     df.to_json(json_file, orient='records', indent=2, date_format='iso')
-    print(f"✓ Exported to JSON: {json_file}")
+    print(f"âœ“ Exported to JSON: {json_file}")
     
     # Excel export
     try:
@@ -401,8 +427,8 @@ def export_data(df, base_filename='osd_status'):
                     'Available Drives',
                     'OSDs Up',
                     'OSDs Down',
-                    'Average Temperature (°C)',
-                    'Max Temperature (°C)',
+                    'Average Temperature (Â°C)',
+                    'Max Temperature (Â°C)',
                     'Average Latency (ms)',
                     'Max Latency (ms)',
                     'SMART Errors',
@@ -438,7 +464,7 @@ def export_data(df, base_filename='osd_status'):
             if len(problem_drives) > 0:
                 problem_drives.to_excel(writer, sheet_name='Problem Drives', index=False)
         
-        print(f"✓ Exported to Excel: {excel_file}")
+        print(f"âœ“ Exported to Excel: {excel_file}")
     except Exception as e:
         print(f"WARNING: Could not export to Excel: {e}")
 
@@ -455,7 +481,7 @@ def append_to_history(df, history_file='osd_history.csv'):
             combined = df
         
         combined.to_csv(history_file, index=False)
-        print(f"✓ Appended to history: {history_file}")
+        print(f"âœ“ Appended to history: {history_file}")
         print(f"  Total records: {len(combined)}")
     except Exception as e:
         print(f"WARNING: Could not append to history: {e}")
