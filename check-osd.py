@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Ceph OSD Drive Monitor - Metadata-First Approach
+Ceph OSD Drive Monitor - Enhanced Edition
 
-Strategy:
-1. Query ceph metadata for ALL OSDs (complete source of truth)
-2. Scan local hardware to find physical drives
-3. Match local drives to OSDs using model+serial from device_ids
-4. Get complete status: up/down, in/out, systemd service
-5. Show everything with proper debugging
+New features:
+- Shows ALL drives (even those without /dev/sdX mappings)
+- SMART health details (reallocated sectors, power-on hours, temperature)
+- OSD performance metrics (commit/apply latency)
+- Identifies drives available for new OSDs
+- Provides recommendations for drive replacement
 """
 
 import subprocess
@@ -15,6 +15,7 @@ import json
 import sys
 import os
 import re
+from datetime import datetime
 
 DEBUG = True  # Set to False to reduce output
 
@@ -59,10 +60,66 @@ def find_raid_controller():
     debug_print("No RAID controller found, defaulting to /dev/sg6")
     return "/dev/sg6"
 
+def extract_smart_details(smart_info):
+    """Extract key SMART attributes from smartctl JSON output."""
+    details = {
+        'temperature': None,
+        'power_on_hours': None,
+        'reallocated_sectors': None,
+        'pending_sectors': None,
+        'uncorrectable': None,
+        'load_cycle_count': None,
+    }
+    
+    # Get temperature
+    if 'temperature' in smart_info:
+        details['temperature'] = smart_info['temperature'].get('current')
+    
+    # Get SMART attributes (for ATA drives)
+    if 'ata_smart_attributes' in smart_info and 'table' in smart_info['ata_smart_attributes']:
+        for attr in smart_info['ata_smart_attributes']['table']:
+            attr_id = attr.get('id')
+            raw_value = attr.get('raw', {}).get('value', 0)
+            
+            if attr_id == 5:  # Reallocated_Sector_Ct
+                details['reallocated_sectors'] = raw_value
+            elif attr_id == 9:  # Power_On_Hours
+                details['power_on_hours'] = raw_value
+            elif attr_id == 193:  # Load_Cycle_Count
+                details['load_cycle_count'] = raw_value
+            elif attr_id == 197:  # Current_Pending_Sector
+                details['pending_sectors'] = raw_value
+            elif attr_id == 198:  # Offline_Uncorrectable
+                details['uncorrectable'] = raw_value
+    
+    # For SCSI/SAS drives, look in different location
+    if 'scsi_grown_defect_list' in smart_info:
+        details['reallocated_sectors'] = smart_info.get('scsi_grown_defect_list', 0)
+    
+    return details
+
+def format_size_bytes(size_bytes):
+    """Convert bytes to human-readable format."""
+    if not size_bytes:
+        return None
+    
+    try:
+        size_bytes = int(size_bytes)
+    except (ValueError, TypeError):
+        return None
+    
+    # Convert to TB/GB
+    if size_bytes >= 1e12:  # 1 TB
+        return f"{size_bytes / 1e12:.1f}T"
+    elif size_bytes >= 1e9:  # 1 GB
+        return f"{size_bytes / 1e9:.0f}G"
+    else:
+        return f"{size_bytes / 1e6:.0f}M"
+
 def get_local_physical_drives():
     """
-    Scan local RAID controller for physical drives.
-    Returns: {serial: {phy_id, serial, model, vendor, health_hw}}
+    Scan local RAID controller for ALL physical drives.
+    Returns: {serial: {phy_id, serial, model, vendor, health_hw, smart_details, size}}
     """
     print("\n" + "="*80)
     print("STEP 1: Scanning Local Hardware")
@@ -82,12 +139,34 @@ def get_local_physical_drives():
 
             # Extract vendor from model if not separate
             if not vendor and model:
-                # Models often start with vendor name
                 vendor_match = re.match(r'^(\w+)', model)
                 if vendor_match:
                     vendor = vendor_match.group(1)
 
             health_passed = info.get('smart_status', {}).get('passed', False)
+            
+            # Extract detailed SMART attributes
+            smart_details = extract_smart_details(info)
+            
+            # Extract size from smartctl output
+            size = None
+            if 'user_capacity' in info:
+                # user_capacity is in format {"blocks": X, "bytes": Y}
+                size_info = info['user_capacity']
+                if isinstance(size_info, dict) and 'bytes' in size_info:
+                    size = format_size_bytes(size_info['bytes'])
+            
+            # Alternative: check for logical_block_size and total blocks
+            if not size and 'logical_block_size' in info:
+                try:
+                    block_size = info.get('logical_block_size', 0)
+                    # Try to find total blocks
+                    if 'ata_device_statistics' in info:
+                        # Look for total blocks in ATA stats
+                        pass
+                    # For now, if we couldn't get size, leave it as None
+                except:
+                    pass
 
             drives[serial] = {
                 'phy_id': phy_id,
@@ -95,12 +174,13 @@ def get_local_physical_drives():
                 'model': model,
                 'vendor': vendor,
                 'health_hw': 'OK' if health_passed else 'FAIL',
+                'smart_details': smart_details,
                 'current_device': None,
                 'scsi_address': None,
-                'size': None,
+                'size': size,  # Now populated from smartctl
             }
 
-            debug_print(f"PHY {phy_id}: {model} S/N:{serial}")
+            debug_print(f"PHY {phy_id}: {model} S/N:{serial} Size:{size or 'N/A'}")
 
     print(f"Found {len(drives)} physical drives on RAID controller")
     return drives
@@ -119,15 +199,13 @@ def map_drives_to_devices(drives):
 
     if lsscsi_output:
         for line in lsscsi_output.splitlines():
-            # Parse lsscsi output format:
-            # [0:0:2:0]    disk    HITACHI  H0S726T4CLAR4000 S430  /dev/sdd
             match = re.match(r'\[([^\]]+)\]\s+(\w+)\s+(\S+)\s+(\S+)\s+\S+\s+(/dev/\w+)', line)
             if match:
-                scsi_addr = match.group(1)  # e.g., "0:0:2:0"
-                dev_type = match.group(2)   # e.g., "disk"
-                vendor = match.group(3)     # e.g., "HITACHI"
-                model = match.group(4)      # e.g., "H0S726T4CLAR4000"
-                dev_path = match.group(5)   # e.g., "/dev/sdd"
+                scsi_addr = match.group(1)
+                dev_type = match.group(2)
+                vendor = match.group(3)
+                model = match.group(4)
+                dev_path = match.group(5)
                 dev_name = dev_path.replace('/dev/', '')
 
                 if dev_type != 'disk':
@@ -146,47 +224,24 @@ def map_drives_to_devices(drives):
                         if vendor and model:
                             drives[serial]['model'] = f"{vendor} {model}"
 
-                        # Get size
+                        # Get size from lsblk (this will override smartctl size if available)
                         lsblk_info = run_command(["lsblk", "-J", "-o", "NAME,SIZE", dev_path],
                                                 is_json=True, silent=True)
                         if lsblk_info and 'blockdevices' in lsblk_info:
-                            drives[serial]['size'] = lsblk_info['blockdevices'][0].get('size', 'N/A')
+                            lsblk_size = lsblk_info['blockdevices'][0].get('size', None)
+                            if lsblk_size:
+                                drives[serial]['size'] = lsblk_size
 
-                        debug_print(f"{dev_name}: SCSI {scsi_addr}, Serial {serial}, PHY {drives[serial]['phy_id']}")
-
-    # Fallback for drives not found via lsscsi
-    lsblk_output = run_command(["lsblk", "-d", "-n", "-o", "NAME,TYPE"], is_json=False, silent=True)
-    if lsblk_output:
-        for line in lsblk_output.splitlines():
-            parts = line.split()
-            if len(parts) >= 2 and parts[1] == 'disk' and not parts[0].startswith(('loop', 'ram', 'sr')):
-                dev = parts[0]
-                dev_path = f"/dev/{dev}"
-
-                # Get device info including serial
-                info = run_command(["smartctl", "-j", "-i", dev_path], is_json=True, silent=True)
-                if info and 'serial_number' in info:
-                    serial = info['serial_number']
-
-                    if serial in drives and not drives[serial].get('current_device'):
-                        drives[serial]['current_device'] = dev
-
-                        # Get size
-                        lsblk_info = run_command(["lsblk", "-J", "-o", "NAME,SIZE", dev_path],
-                                                is_json=True, silent=True)
-                        if lsblk_info and 'blockdevices' in lsblk_info:
-                            drives[serial]['size'] = lsblk_info['blockdevices'][0].get('size', 'N/A')
-
-                        debug_print(f"{dev}: Serial {serial} (fallback - no SCSI address)")
+                        debug_print(f"{dev_name}: SCSI {scsi_addr}, Serial {serial}, PHY {drives[serial]['phy_id']}, Size {drives[serial]['size']}")
 
     mapped = sum(1 for d in drives.values() if d.get('current_device'))
+    unmapped = len(drives) - mapped
     print(f"Mapped {mapped}/{len(drives)} physical drives to device names")
+    if unmapped > 0:
+        print(f"  {unmapped} drive(s) not visible to OS (may be available for new OSDs)")
 
 def get_ceph_osds():
-    """
-    Get ALL Ceph OSDs metadata.
-    Returns: {osd_id: {metadata...}}
-    """
+    """Get ALL Ceph OSDs metadata."""
     print("\n" + "="*80)
     print("STEP 3: Querying Ceph Cluster for ALL OSDs")
     print("="*80)
@@ -206,15 +261,41 @@ def get_ceph_osds():
     print(f"Found {len(osds)} OSDs in cluster")
     return osds
 
+def get_osd_performance():
+    """Get OSD performance metrics (latency)."""
+    print("\n" + "="*80)
+    print("STEP 4: Getting OSD Performance Metrics")
+    print("="*80)
+
+    perf = {}
+    output = run_command(["ceph", "osd", "perf"], is_json=False, silent=True)
+    
+    if output:
+        for line in output.splitlines():
+            # Skip header
+            if 'osd' in line and 'commit_latency' in line:
+                continue
+            
+            # Parse lines like: " 51                  61                 61"
+            match = re.match(r'\s*(\d+)\s+(\d+)\s+(\d+)', line)
+            if match:
+                osd_id = match.group(1)
+                commit_lat = int(match.group(2))
+                apply_lat = int(match.group(3))
+                perf[osd_id] = {
+                    'commit_latency_ms': commit_lat,
+                    'apply_latency_ms': apply_lat
+                }
+                debug_print(f"OSD {osd_id}: commit={commit_lat}ms, apply={apply_lat}ms")
+    
+    print(f"Got performance data for {len(perf)} OSDs")
+    return perf
+
 def parse_device_id(device_ids_string):
-    """
-    Parse device_ids string like "sde=SEAGATE_ST8000NM0075_ZA1FMDSH0000C94972BA"
-    Returns: (device_name, vendor, model, serial) or None
-    """
+    """Parse device_ids string from Ceph metadata."""
     if not device_ids_string:
         return None
 
-    # Handle multiple devices (comma-separated)
     for part in device_ids_string.split(','):
         if '=' not in part:
             continue
@@ -223,18 +304,10 @@ def parse_device_id(device_ids_string):
         device_name = device_name.strip()
         identifier = identifier.strip()
 
-        # identifier format is typically: VENDOR_MODEL_SERIAL
-        # Examples:
-        # SEAGATE_ST8000NM0075_ZA1FMDSH0000C94972BA
-        # DELL_PERC_H730P_Adp_003856ae11e849eb2900d4318fa06d86
-        # SEAGATE_DL2400MM0159_WBM0EQ7T
-
         parts = identifier.split('_')
         if len(parts) >= 3:
             vendor = parts[0]
-            # Serial is usually the last part
             serial = parts[-1]
-            # Model is everything in between
             model = '_'.join(parts[1:-1])
 
             return {
@@ -248,15 +321,12 @@ def parse_device_id(device_ids_string):
     return None
 
 def match_drives_to_osds(drives, osds):
-    """
-    Match local physical drives to OSDs using device_ids.
-    Returns: {osd_id: serial}
-    """
+    """Match local physical drives to OSDs using device_ids."""
     print("\n" + "="*80)
-    print("STEP 4: Matching Local Drives to OSDs")
+    print("STEP 5: Matching Local Drives to OSDs")
     print("="*80)
 
-    osd_to_drive = {}  # {osd_id: serial}
+    osd_to_drive = {}
 
     for osd_id, osd_meta in osds.items():
         device_ids = osd_meta.get('device_ids', '')
@@ -267,10 +337,8 @@ def match_drives_to_osds(drives, osds):
             debug_print(f"OSD {osd_id}: Could not parse device_ids: {device_ids}")
             continue
 
-        # Try to match by serial number
         osd_serial = parsed['serial']
 
-        # Check if this serial matches any of our local drives
         if osd_serial in drives:
             osd_to_drive[osd_id] = osd_serial
             print(f"✓ OSD {osd_id} (on {hostname}): Matched to local drive")
@@ -283,12 +351,9 @@ def match_drives_to_osds(drives, osds):
     return osd_to_drive
 
 def get_osd_status():
-    """
-    Get OSD status information: up/down and in/out.
-    Returns: {osd_id: {'up': True/False, 'in': True/False}}
-    """
+    """Get OSD status information: up/down and in/out."""
     print("\n" + "="*80)
-    print("STEP 5: Getting OSD Status")
+    print("STEP 6: Getting OSD Status")
     print("="*80)
 
     status_map = {}
@@ -300,21 +365,20 @@ def get_osd_status():
             match = re.match(r'\s*(\d+)\s+\w+\s+[\d\.]+\s+osd\.\d+\s+(\w+)\s+.*', line)
             if match:
                 osd_id = match.group(1)
-                up_status = match.group(2)  # 'up' or 'down'
+                up_status = match.group(2)
                 status_map[osd_id] = {
                     'up': (up_status == 'up'),
-                    'in': None  # Will fill in from dump
+                    'in': None
                 }
 
     # Get in/out status from dump
     dump_output = run_command(["ceph", "osd", "dump"], is_json=False)
     if dump_output:
         for line in dump_output.splitlines():
-            # Look for lines like: osd.1 up   in  weight 1 up_from 123 ...
             match = re.search(r'osd\.(\d+)\s+(\w+)\s+(\w+)', line)
             if match:
                 osd_id = match.group(1)
-                in_status = match.group(3)  # 'in' or 'out'
+                in_status = match.group(3)
                 if osd_id in status_map:
                     status_map[osd_id]['in'] = (in_status == 'in')
 
@@ -322,20 +386,15 @@ def get_osd_status():
     return status_map
 
 def check_systemd_status(osd_ids):
-    """
-    Check systemd service status for OSDs.
-    Returns: {osd_id: 'active'/'inactive'/'unknown'}
-    """
+    """Check systemd service status for OSDs."""
     print("\n" + "="*80)
-    print("STEP 6: Checking Systemd Service Status")
+    print("STEP 7: Checking Systemd Service Status")
     print("="*80)
 
     systemd_status = {}
 
     for osd_id in osd_ids:
         service_name = f"ceph-osd@{osd_id}.service"
-
-        # Try to check if service is active
         result = run_command(["systemctl", "is-active", service_name],
                            is_json=False, silent=True)
 
@@ -346,7 +405,6 @@ def check_systemd_status(osd_ids):
             systemd_status[osd_id] = 'inactive'
             debug_print(f"OSD {osd_id} systemd: inactive ({result.strip()})")
         else:
-            # Service might not exist or in unknown state
             systemd_status[osd_id] = 'unknown'
             debug_print(f"OSD {osd_id} systemd: unknown")
 
@@ -355,20 +413,16 @@ def check_systemd_status(osd_ids):
 def format_status(up, in_status, systemd):
     """Format combined status string."""
     parts = []
-
-    # Up/Down
     if up:
         parts.append("up")
     else:
         parts.append("DOWN")
 
-    # In/Out
     if in_status:
         parts.append("in")
     else:
         parts.append("OUT")
 
-    # Systemd
     if systemd == 'active':
         parts.append("✓")
     elif systemd == 'inactive':
@@ -378,14 +432,46 @@ def format_status(up, in_status, systemd):
 
     return " ".join(parts)
 
-def format_output(drives, osd_to_drive, osd_status, systemd_status):
+def format_smart_health(smart_details):
+    """Format SMART health summary."""
+    issues = []
+    
+    if smart_details.get('reallocated_sectors') and smart_details['reallocated_sectors'] > 0:
+        issues.append(f"Realloc:{smart_details['reallocated_sectors']}")
+    
+    if smart_details.get('pending_sectors') and smart_details['pending_sectors'] > 0:
+        issues.append(f"Pending:{smart_details['pending_sectors']}")
+    
+    if smart_details.get('uncorrectable') and smart_details['uncorrectable'] > 0:
+        issues.append(f"Uncorr:{smart_details['uncorrectable']}")
+    
+    if issues:
+        return " ".join(issues)
+    
+    return "OK"
+
+def format_age(power_on_hours):
+    """Format power-on hours as human readable age."""
+    if not power_on_hours:
+        return "N/A"
+    
+    years = power_on_hours / 8760  # 24*365
+    if years >= 1:
+        return f"{years:.1f}y"
+    else:
+        months = power_on_hours / 730  # ~30*24
+        return f"{months:.0f}mo"
+
+def format_output(drives, osd_to_drive, osd_status, systemd_status, osd_perf):
     """Format and display the final output table."""
-    print("\n" + "="*120)
-    print("FINAL RESULTS")
-    print("="*120)
+    print("\n" + "="*160)
+    print("DRIVE INVENTORY & OSD STATUS")
+    print("="*160)
 
     # Build rows
     rows = []
+    available_drives = []
+    
     for serial, drive in drives.items():
         # Find OSD for this drive
         osd_id = None
@@ -401,75 +487,96 @@ def format_output(drives, osd_to_drive, osd_status, systemd_status):
             status_str = format_status(status.get('up', False),
                                       status.get('in', False),
                                       systemd)
+            
+            # Get performance
+            perf = osd_perf.get(osd_id, {})
+            latency_str = f"{perf.get('commit_latency_ms', 'N/A')}ms" if perf else "N/A"
         else:
             status_str = "N/A"
+            latency_str = "N/A"
 
         current_dev = drive.get('current_device')
-        current_dev_str = f"/dev/{current_dev}" if current_dev else "N/A"
+        current_dev_str = f"/dev/{current_dev}" if current_dev else "NOT MAPPED"
 
-        # Ensure all values are strings (not None)
         model = drive.get('model', 'Unknown')
-        if model and len(model) > 30:
-            model = model[:27] + "..."
+        if model and len(model) > 24:
+            model = model[:21] + "..."
         elif not model:
             model = 'Unknown'
 
-        # Get SCSI address - ensure it's never None
         scsi_addr = drive.get('scsi_address') or 'N/A'
+        
+        # SMART details
+        smart = drive.get('smart_details', {})
+        smart_health = format_smart_health(smart)
+        temp_str = f"{smart.get('temperature')}°C" if smart.get('temperature') else "N/A"
+        age_str = format_age(smart.get('power_on_hours'))
 
-        rows.append({
+        row = {
             'osd_id': str(osd_id) if osd_id else 'N/A',
             'status': status_str or 'N/A',
+            'latency': latency_str,
             'scsi_addr': scsi_addr if scsi_addr else 'N/A',
             'device': current_dev_str,
             'size': drive.get('size') or 'N/A',
             'phy_id': str(drive['phy_id']),
             'serial': serial or 'N/A',
             'health': drive.get('health_hw') or 'N/A',
+            'smart_health': smart_health,
+            'temp': temp_str,
+            'age': age_str,
             'model': model or 'Unknown'
-        })
+        }
+        
+        rows.append(row)
+        
+        # Track available drives
+        if not osd_id and current_dev:
+            available_drives.append(row)
 
-    # Sort by SCSI address if available, otherwise by PHY ID
+    # Sort by SCSI address, then PHY ID
     def sort_key(row):
         scsi = row.get('scsi_addr')
         if scsi and scsi != 'N/A':
-            # Parse SCSI address [H:C:T:L] for sorting
             try:
                 parts = [int(x) for x in scsi.split(':')]
-                return (0, parts)  # SCSI addresses first
+                return (0, parts)
             except:
                 pass
-        # Sort by PHY ID for drives without SCSI address
         try:
             phy_id = int(row['phy_id']) if isinstance(row['phy_id'], str) else row['phy_id']
             return (1, phy_id)
         except:
-            return (2, 999)  # Unknown drives last
+            return (2, 999)
 
     rows.sort(key=sort_key)
 
     # Print header
-    print("="*140)
-    header_fmt = "{:<6} | {:<14} | {:<11} | {:<14} | {:<8} | {:<6} | {:<24} | {:<10} | {:<30}"
-    print(header_fmt.format("OSD ID", "Status", "SCSI Addr", "Current Device", "Size", "PHY ID",
-                           "Serial Number", "HW Health", "Model"))
-    print("="*140)
+    print("="*160)
+    header_fmt = "{:<6} | {:<13} | {:<7} | {:<11} | {:<14} | {:<7} | {:<5} | {:<20} | {:<5} | {:<15} | {:<5} | {:<5} | {:<24}"
+    print(header_fmt.format("OSD ID", "Status", "Latency", "SCSI Addr", "Current Device", "Size", "PHY", 
+                           "Serial Number", "HW", "SMART Health", "Temp", "Age", "Model"))
+    print("="*160)
 
     # Print rows
     for row in rows:
         print(header_fmt.format(
             row['osd_id'],
             row['status'],
+            row['latency'],
             row['scsi_addr'],
             row['device'],
             row['size'],
             row['phy_id'],
-            row['serial'],
+            row['serial'][:20],  # Truncate long serials
             row['health'],
+            row['smart_health'],
+            row['temp'],
+            row['age'],
             row['model']
         ))
 
-    print("="*140)
+    print("="*160)
 
     # Summary
     total_drives = len(drives)
@@ -480,15 +587,77 @@ def format_output(drives, osd_to_drive, osd_status, systemd_status):
     osds_out = sum(1 for oid in osd_to_drive if not osd_status.get(oid, {}).get('in', True))
     systemd_active = sum(1 for oid in osd_to_drive if systemd_status.get(oid) == 'active')
     hw_failed = sum(1 for d in drives.values() if d['health_hw'] == 'FAIL')
+    drives_available = len(available_drives)
 
     print(f"\nSummary:")
     print(f"  Physical drives: {total_drives}")
     print(f"  Drives with OSDs: {drives_with_osds}")
+    print(f"  Available for new OSDs: {drives_available}")
     print(f"  OSD Status: {osds_up} up/{osds_down} down, {osds_in} in/{osds_out} out")
     print(f"  Systemd: {systemd_active} active services")
-    print(f"  Hardware: {hw_failed} failures")
+    print(f"  Hardware failures: {hw_failed}")
+    
+    # Show available drives
+    if available_drives:
+        print(f"\n" + "="*80)
+        print(f"DRIVES AVAILABLE FOR NEW OSDS ({len(available_drives)})")
+        print("="*80)
+        for avail in available_drives:
+            print(f"  PHY {avail['phy_id']}: {avail['device']} - {avail['size']} - {avail['model']}")
+            print(f"    Serial: {avail['serial']}, SCSI: {avail['scsi_addr']}, Age: {avail['age']}, Temp: {avail['temp']}")
+            print(f"    Command: sudo ceph-volume lvm create --data {avail['device']}")
+    
+    # Recommendations
+    print(f"\n" + "="*80)
+    print("RECOMMENDATIONS")
+    print("="*80)
+    
+    # Check for drives with SMART issues - FIXED: Handle None values properly
+    problematic_drives = []
+    for serial, drive in drives.items():
+        smart = drive.get('smart_details', {})
+        if ((smart.get('reallocated_sectors') or 0) > 0 or 
+            (smart.get('pending_sectors') or 0) > 0 or 
+            (smart.get('uncorrectable') or 0) > 0):
+            # Find OSD ID
+            osd_id = None
+            for oid, drv_serial in osd_to_drive.items():
+                if drv_serial == serial:
+                    osd_id = oid
+                    break
+            problematic_drives.append((osd_id, drive))
+    
+    if problematic_drives:
+        print("⚠️  URGENT: Drives with SMART errors (REPLACE IMMEDIATELY!):")
+        for osd_id, drive in problematic_drives:
+            smart = drive['smart_details']
+            print(f"  OSD {osd_id if osd_id else 'N/A'} (PHY {drive['phy_id']}): "
+                  f"Realloc={smart.get('reallocated_sectors') or 0}, "
+                  f"Pending={smart.get('pending_sectors') or 0}, "
+                  f"Uncorr={smart.get('uncorrectable') or 0}")
+    else:
+        print("✓ No drives with SMART errors detected")
+    
+    # Check for high latency OSDs
+    high_latency = []
+    for osd_id, perf in osd_perf.items():
+        if perf.get('commit_latency_ms', 0) > 100:
+            high_latency.append((osd_id, perf['commit_latency_ms']))
+    
+    if high_latency:
+        high_latency.sort(key=lambda x: x[1], reverse=True)
+        print(f"\n⚠️  OSDs with high latency (>100ms):")
+        for osd_id, lat in high_latency[:5]:  # Show top 5
+            print(f"  OSD {osd_id}: {lat}ms")
+            # Find drive info
+            for oid, serial in osd_to_drive.items():
+                if oid == osd_id:
+                    drive = drives[serial]
+                    print(f"    PHY {drive['phy_id']}, Age: {format_age(drive['smart_details'].get('power_on_hours'))}")
+                    break
+    
     print(f"\nStatus Legend: [up/DOWN] [in/OUT] [✓ active / ✗ inactive / ? unknown]")
-    print(f"SCSI Address: [Host:Channel:Target:LUN] - Physical location on controller (stable across reboots)")
+    print(f"SCSI Address: [Host:Channel:Target:LUN] - Physical location on controller")
 
 def main():
     if os.geteuid() != 0:
@@ -496,7 +665,7 @@ def main():
         sys.exit(1)
 
     print("="*80)
-    print("CEPH OSD DRIVE MONITOR - Metadata-First Approach")
+    print("CEPH OSD DRIVE MONITOR - Enhanced Edition")
     print("="*80)
 
     # Step 1: Scan local hardware
@@ -514,17 +683,20 @@ def main():
         print("ERROR: Could not get OSD metadata from Ceph")
         sys.exit(1)
 
-    # Step 4: Match local drives to OSDs
+    # Step 4: Get OSD performance
+    osd_perf = get_osd_performance()
+
+    # Step 5: Match local drives to OSDs
     osd_to_drive = match_drives_to_osds(drives, osds)
 
-    # Step 5: Get OSD status (up/down, in/out)
+    # Step 6: Get OSD status (up/down, in/out)
     osd_status = get_osd_status()
 
-    # Step 6: Check systemd status
+    # Step 7: Check systemd status
     systemd_status = check_systemd_status(osd_to_drive.keys())
 
     # Display results
-    format_output(drives, osd_to_drive, osd_status, systemd_status)
+    format_output(drives, osd_to_drive, osd_status, systemd_status, osd_perf)
 
 if __name__ == "__main__":
     main()
