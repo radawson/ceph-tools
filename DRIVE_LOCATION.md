@@ -1,5 +1,19 @@
 # Drive Location and LED Control Guide
 
+## Prerequisites
+
+Before using the drive location features, install required packages:
+
+```bash
+sudo apt update
+sudo apt install -y sg3-utils ledmon
+```
+
+- **sg3-utils** - Provides `sg_ses` for querying enclosure bay mappings
+- **ledmon** - Provides `ledctl` for LED control (optional but recommended)
+
+---
+
 ## The Problem: Finding Physical Drives
 
 When you need to replace a failing drive, you face a challenge: **How do you know which physical drive in the rack corresponds to `/dev/sda` or `OSD.42`?**

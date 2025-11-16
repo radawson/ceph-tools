@@ -1,5 +1,7 @@
 # Ceph OSD Drive Monitor - Complete Package
 
+version 1.0.3
+
 ## 📋 All Files Index
 
 ### 🐍 Python Scripts (5 files, 119 KB total)
@@ -29,9 +31,52 @@
 
 ---
 
+## 📦 System Requirements
+
+### Required OS Packages
+
+These system packages must be installed on all nodes:
+
+```bash
+# Install all required packages
+sudo apt update
+sudo apt install -y smartmontools lsscsi sg3-utils ledmon
+```
+
+**Package Details:**
+
+| Package | Purpose | Used By |
+|---------|---------|---------|
+| **smartmontools** | Provides `smartctl` for drive SMART data | All scripts |
+| **lsscsi** | Lists SCSI devices and topology | All scripts |
+| **sg3-utils** | Provides `sg_ses` for enclosure management | Enclosure bay mapping & LED control |
+| **ledmon** | Provides `ledctl` for LED control (optional) | LED blinking feature |
+| **ceph** | Ceph cluster commands | All scripts (already installed) |
+
+**Pre-installed (no action needed):**
+- `lsblk` - Block device info (from util-linux)
+- `systemctl` - Service status (from systemd)
+- `pvs`, `lvs` - LVM info (from lvm2)
+
+### Optional Python Dependencies
+
+For the Rich/Pandas versions only:
+
+```bash
+pip3 install rich pandas openpyxl
+```
+
+| Package | Size | Purpose |
+|---------|------|---------|
+| **rich** | ~500 KB | Beautiful color output |
+| **pandas** | ~30 MB | Data analysis |
+| **openpyxl** | ~2 MB | Excel export |
+
+---
+
 ## 🚀 Quick Start (Choose Your Path)
 
-### Path A: Minimal (No Dependencies)
+### Path A: Minimal (System Dependencies Already Installed)
 
 ```bash
 # 1. Copy files

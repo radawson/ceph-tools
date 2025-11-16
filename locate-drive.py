@@ -15,8 +15,30 @@ import sys
 import subprocess
 import json
 import os
+import shutil
 
 VERSION = "1.0.3"
+
+
+def check_dependencies():
+    """Check if required system packages are installed."""
+    missing = []
+    
+    # Check for sg_ses (from sg3-utils)
+    if not shutil.which("sg_ses"):
+        missing.append("sg3-utils (provides sg_ses for enclosure bay mapping)")
+    
+    # Check for ledctl (from ledmon) - optional but recommended
+    if not shutil.which("ledctl"):
+        missing.append("ledmon (provides ledctl for LED control) - OPTIONAL")
+    
+    if missing:
+        print("⚠️  Some packages are not installed:", file=sys.stderr)
+        for pkg in missing:
+            print(f"   - {pkg}", file=sys.stderr)
+        print("\nInstall with:", file=sys.stderr)
+        print("  sudo apt install -y sg3-utils ledmon", file=sys.stderr)
+        print("\nNote: The script will still run but some features may not work.\n", file=sys.stderr)
 
 
 def run_command(cmd, silent=False):
@@ -146,6 +168,9 @@ def main():
     if os.geteuid() != 0:
         print("Error: This script must be run with sudo", file=sys.stderr)
         sys.exit(1)
+    
+    # Check for required dependencies
+    check_dependencies()
 
     if len(sys.argv) < 2:
         print(__doc__)

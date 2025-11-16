@@ -2,11 +2,23 @@
 
 ## Get Running in 5 Minutes
 
-### Step 1: Install Dependencies (1 minute)
+### Step 1: Install System Dependencies (1 minute)
 
 ```bash
+# Install required OS packages (if not already installed)
+sudo apt update
+sudo apt install -y smartmontools lsscsi sg3-utils ledmon
+
+# Install optional Python packages (for Rich/Pandas versions)
 sudo pip3 install rich pandas openpyxl
 ```
+
+**What these packages do:**
+- `smartmontools` - Drive SMART data collection
+- `lsscsi` - SCSI device topology
+- `sg3-utils` - Enclosure management (bay mapping)
+- `ledmon` - LED control (drive location)
+- `rich`, `pandas`, `openpyxl` - Beautiful output & exports
 
 ### Step 2: Download and Run (30 seconds)
 
