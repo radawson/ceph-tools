@@ -68,6 +68,7 @@ class OSDMonitor:
         self.systemd_status = {}
         self.osd_perf = {}
         self.scan_timestamp = None
+        self.enclosures = {}  # SES enclosure devices for LED control
     
     def find_raid_controllers(self):
         """Find ALL RAID controllers and JBOD enclosures."""
@@ -78,93 +79,224 @@ class OSDMonitor:
         # Scan wider range to catch JBOD enclosures (like MD1400 at sg24)
         for i in range(30):
             sg_dev = f"/dev/sg{i}"
-            if os.path.exists(sg_dev):
-                info = run_command(["smartctl", "-i", sg_dev], is_json=False, silent=True)
+            if not os.path.exists(sg_dev):
+                continue
                 
-                if not info:
+            info = run_command(["smartctl", "-i", sg_dev], is_json=False, silent=True)
+            
+            if not info:
+                continue
+            
+            info_lower = info.lower()
+            
+            # Debug: show what we found
+            first_line = info.split('\n')[0] if info else 'empty'
+            debug_print(f"Checking {sg_dev}: {first_line}")
+            
+            # Check if this is a controller/enclosure we want to track
+            is_raid = 'megaraid' in info_lower or 'raid' in info_lower or 'perc' in info_lower
+            is_jbod = 'md1400' in info_lower or 'md1200' in info_lower or 'jbod' in info_lower
+            is_enclosure = 'enclosure' in info_lower
+            
+            if is_raid or is_jbod or is_enclosure:
+                controller_type = 'Unknown'
+                controller_model = 'Unknown'
+                controller_serial = None
+                is_megaraid_type = False
+                
+                for line in info.split('\n'):
+                    line_lower = line.lower()
+                    if 'product' in line_lower or 'device model' in line_lower:
+                        if ':' in line:
+                            model = line.split(':', 1)[1].strip()
+                            controller_model = model
+                            
+                            # Check for JBOD/SAS expander enclosures
+                            if 'md1400' in model.lower():
+                                controller_type = 'MD1400 JBOD'
+                                is_megaraid_type = False
+                            elif 'md1200' in model.lower():
+                                controller_type = 'MD1200 JBOD'
+                                is_megaraid_type = False
+                            # Identify specific Dell PERC models
+                            elif 'h730' in model.lower():
+                                controller_type = 'PERC H730'
+                                is_megaraid_type = True
+                            elif 'h830' in model.lower():
+                                controller_type = 'PERC H830'
+                                is_megaraid_type = True
+                            elif 'h740' in model.lower():
+                                controller_type = 'PERC H740'
+                                is_megaraid_type = True
+                            elif 'h840' in model.lower():
+                                controller_type = 'PERC H840'
+                                is_megaraid_type = True
+                            elif 'perc' in model.lower():
+                                controller_type = 'PERC'
+                                is_megaraid_type = True
+                            elif 'megaraid' in model.lower() or 'lsi' in model.lower():
+                                controller_type = 'MegaRAID/LSI'
+                                is_megaraid_type = True
+                    
+                    elif 'serial number' in line_lower:
+                        if ':' in line:
+                            controller_serial = line.split(':', 1)[1].strip()
+                
+                # Skip duplicate controllers (same serial = same physical controller)
+                if controller_serial and controller_serial in seen_serials:
+                    debug_print(f"{sg_dev}: Duplicate controller with S/N {controller_serial}, skipping")
                     continue
                 
-                info_lower = info.lower()
+                if controller_serial:
+                    seen_serials.add(controller_serial)
                 
-                # Check if this is a controller/enclosure we want to track
-                is_raid = 'megaraid' in info_lower or 'raid' in info_lower or 'perc' in info_lower
-                is_jbod = 'md1400' in info_lower or 'md1200' in info_lower or 'jbod' in info_lower
-                is_enclosure = 'enclosure' in info_lower
-                
-                if is_raid or is_jbod or is_enclosure:
-                    controller_type = 'Unknown'
-                    controller_model = 'Unknown'
-                    controller_serial = None
-                    is_megaraid_type = False
-                    
-                    for line in info.split('\n'):
-                        line_lower = line.lower()
-                        if 'product' in line_lower or 'device model' in line_lower:
-                            if ':' in line:
-                                model = line.split(':', 1)[1].strip()
-                                controller_model = model
-                                
-                                # Check for JBOD/SAS expander enclosures
-                                if 'md1400' in model.lower():
-                                    controller_type = 'MD1400 JBOD'
-                                    is_megaraid_type = False
-                                elif 'md1200' in model.lower():
-                                    controller_type = 'MD1200 JBOD'
-                                    is_megaraid_type = False
-                                # Identify specific Dell PERC models
-                                elif 'h730' in model.lower():
-                                    controller_type = 'PERC H730'
-                                    is_megaraid_type = True
-                                elif 'h830' in model.lower():
-                                    controller_type = 'PERC H830'
-                                    is_megaraid_type = True
-                                elif 'h740' in model.lower():
-                                    controller_type = 'PERC H740'
-                                    is_megaraid_type = True
-                                elif 'h840' in model.lower():
-                                    controller_type = 'PERC H840'
-                                    is_megaraid_type = True
-                                elif 'perc' in model.lower():
-                                    controller_type = 'PERC'
-                                    is_megaraid_type = True
-                                elif 'megaraid' in model.lower() or 'lsi' in model.lower():
-                                    controller_type = 'MegaRAID/LSI'
-                                    is_megaraid_type = True
-                        
-                        elif 'serial number' in line_lower:
-                            if ':' in line:
-                                controller_serial = line.split(':', 1)[1].strip()
-                    
-                    # Skip duplicate controllers (same serial = same physical controller)
-                    if controller_serial and controller_serial in seen_serials:
-                        debug_print(f"{sg_dev}: Duplicate controller with S/N {controller_serial}, skipping")
-                        continue
-                    
-                    if controller_serial:
-                        seen_serials.add(controller_serial)
-                    
-                    controllers.append({
-                        'device': sg_dev,
-                        'type': controller_type,
-                        'model': controller_model,
-                        'index': i,
-                        'is_megaraid': is_megaraid_type,
-                        'serial': controller_serial
-                    })
-                    debug_print(f"Found RAID controller at {sg_dev}: {controller_type} ({controller_model})")
+                controllers.append({
+                    'device': sg_dev,
+                    'type': controller_type,
+                    'model': controller_model,
+                    'index': i,
+                    'is_megaraid': is_megaraid_type,
+                    'serial': controller_serial
+                })
+                debug_print(f"Found RAID controller at {sg_dev}: {controller_type} ({controller_model})")
         
         if not controllers:
-            debug_print("No RAID controllers found, defaulting to /dev/sg6")
+            debug_print("No RAID controllers or JBOD enclosures found!")
+            debug_print("Will attempt to scan all available disk devices directly...")
+            # Create a pseudo-controller for direct disk scanning
             controllers = [{
-                'device': '/dev/sg6',
-                'type': 'Unknown',
-                'model': 'Unknown',
-                'index': 6
+                'device': 'direct',
+                'type': 'Direct Disk Access',
+                'model': 'No RAID/JBOD detected',
+                'index': 0,
+                'is_megaraid': False,
+                'serial': None
             }]
         else:
             debug_print(f"Total controllers found: {len(controllers)}")
         
         return controllers
+    
+    def find_ses_enclosures(self):
+        """
+        Find SCSI Enclosure Services (SES) devices for LED control and bay mapping.
+        
+        Returns:
+            dict: {scsi_host: {'device': '/dev/sgX', 'name': 'MD1400', 'slots': []}}
+        """
+        enclosures = {}
+        
+        debug_print("Looking for SES enclosure devices...")
+        
+        # Find enclosure devices from lsscsi
+        lsscsi_output = run_command(["lsscsi", "-g"], is_json=False, silent=True)
+        if not lsscsi_output:
+            return enclosures
+        
+        for line in lsscsi_output.splitlines():
+            if 'enclosu' in line.lower():
+                # Parse: [7:0:7:0]   enclosu DELL     MD1400           1.07  /dev/sg10
+                match = re.match(r'\[(\d+):(\d+):(\d+):(\d+)\]\s+enclosu\s+(\S+)\s+(\S+)\s+(\S+)\s+(/dev/sg\d+)', line)
+                if not match:
+                    # Try without sg device
+                    match = re.match(r'\[(\d+):(\d+):(\d+):(\d+)\]\s+enclosu\s+(\S+)\s+(\S+)', line)
+                
+                if match:
+                    host = int(match.group(1))
+                    vendor = match.group(5)
+                    model = match.group(6)
+                    sg_dev = match.group(8) if len(match.groups()) >= 8 else None
+                    
+                    if sg_dev:
+                        enclosures[host] = {
+                            'device': sg_dev,
+                            'name': f"{vendor} {model}",
+                            'host': host,
+                            'slots': {}
+                        }
+                        debug_print(f"Found SES enclosure: {sg_dev} - {vendor} {model} on host {host}")
+                        
+                        # Try to get slot information from sg_ses
+                        self._map_enclosure_slots(enclosures[host])
+        
+        return enclosures
+    
+    def _map_enclosure_slots(self, enclosure):
+        """
+        Query SES enclosure to map slot numbers to SCSI addresses.
+        Uses sg_ses to get the actual bay/slot mapping.
+        """
+        sg_dev = enclosure['device']
+        
+        # Run sg_ses to get slot information
+        # sg_ses output format varies, so we'll try to parse it
+        ses_output = run_command(["sg_ses", sg_dev], is_json=False, silent=True)
+        
+        if not ses_output:
+            debug_print(f"  Could not query SES info from {sg_dev}")
+            return
+        
+        # Parse sg_ses output to find array devices and their slots
+        # This is enclosure-specific, but MD1400 typically shows:
+        # "Element index: X, [SCSI address: Y:Z:W:L]"
+        current_slot = None
+        for line in ses_output.splitlines():
+            # Look for element index (slot number)
+            if 'Element index:' in line:
+                match = re.search(r'Element index:\s*(\d+)', line)
+                if match:
+                    current_slot = int(match.group(1))
+            
+            # Look for SCSI address association
+            if current_slot is not None and 'SCSI address:' in line:
+                match = re.search(r'SCSI address:\s*(\d+):(\d+):(\d+):(\d+)', line)
+                if match:
+                    scsi_addr = f"{match.group(1)}:{match.group(2)}:{match.group(3)}:{match.group(4)}"
+                    enclosure['slots'][scsi_addr] = current_slot
+                    debug_print(f"  Slot {current_slot} -> SCSI {scsi_addr}")
+                    current_slot = None
+    
+    @staticmethod
+    def locate_drive_on(device_path):
+        """
+        Turn ON the locate LED for a drive.
+        
+        Args:
+            device_path: /dev/sdX or /dev/sgY
+            
+        Returns:
+            bool: True if successful
+        """
+        # Try ledctl first (simpler)
+        result = run_command(["ledctl", f"locate={device_path}"], silent=True)
+        if result is not None:
+            debug_print(f"LED ON for {device_path} via ledctl")
+            return True
+        
+        # Fall back to sg_ses if ledctl not available
+        # This requires knowing the enclosure and slot - more complex
+        debug_print(f"ledctl not available for {device_path}, would need sg_ses with slot info")
+        return False
+    
+    @staticmethod
+    def locate_drive_off(device_path):
+        """
+        Turn OFF the locate LED for a drive.
+        
+        Args:
+            device_path: /dev/sdX or /dev/sgY
+            
+        Returns:
+            bool: True if successful
+        """
+        # Try ledctl first
+        result = run_command(["ledctl", f"locate_off={device_path}"], silent=True)
+        if result is not None:
+            debug_print(f"LED OFF for {device_path} via ledctl")
+            return True
+        
+        debug_print(f"ledctl not available for {device_path}")
+        return False
     
     @staticmethod
     def build_scsi_address_from_phy(phy_id, controller_index):
@@ -239,7 +371,10 @@ class OSDMonitor:
     
     def scan_jbod_enclosure(self, controller, seen_serials):
         """
-        Scan a JBOD enclosure by finding its SCSI host and enumerating targets.
+        Scan a JBOD enclosure by finding all disk devices and checking if they match.
+        
+        For JBOD enclosures, drives are typically visible as regular SCSI disks.
+        We'll scan all disk devices from lsscsi and query them directly.
         
         Returns:
             dict: drives found in this enclosure
@@ -249,56 +384,90 @@ class OSDMonitor:
         controller_type = controller['type']
         controller_index = controller['index']
         
-        # Get the SCSI host number from lsscsi
-        lsscsi_output = run_command(["lsscsi"], is_json=False, silent=True)
+        debug_print(f"JBOD {controller_dev}: Starting enclosure scan...")
+        
+        # Get all SCSI devices from lsscsi
+        lsscsi_output = run_command(["lsscsi", "-g"], is_json=False, silent=True)
         if not lsscsi_output:
+            debug_print(f"JBOD {controller_dev}: lsscsi command failed")
             return drives
         
-        # Find all SCSI addresses for this host (controller_index)
-        # Looking for pattern: [24:0:26:0] for drives on host 24
-        targets_found = set()
+        debug_print(f"JBOD {controller_dev}: Full lsscsi output:")
         for line in lsscsi_output.splitlines():
-            match = re.match(r'\[(\d+):(\d+):(\d+):(\d+)\]', line)
-            if match:
-                host = int(match.group(1))
-                channel = int(match.group(2))
-                target = int(match.group(3))
-                lun = int(match.group(4))
+            debug_print(f"  lsscsi: {line}")
+        
+        # Parse lsscsi output to find all disk devices
+        # Format: [H:C:T:L]  disk  Vendor  Model  Rev  /dev/sdX  /dev/sgY
+        # Note: /dev/sgY is optional (depends on -g flag)
+        disk_devices = []
+        for line in lsscsi_output.splitlines():
+            # Look for disk entries
+            if 'disk' in line.lower():
+                # Try with sg device first
+                match = re.match(r'\[(\d+):(\d+):(\d+):(\d+)\]\s+disk\s+(\S+)\s+(\S+)\s+(\S+)\s+(/dev/sd\w+)\s+(/dev/sg\d+)', line)
+                sg_dev = None
+                if match:
+                    sg_dev = match.group(9)
+                else:
+                    # Try without sg device
+                    match = re.match(r'\[(\d+):(\d+):(\d+):(\d+)\]\s+disk\s+(\S+)\s+(\S+)\s+(\S+)\s+(/dev/sd\w+)', line)
                 
-                if host == controller_index:
-                    targets_found.add((channel, target, lun))
+                if match:
+                    host = int(match.group(1))
+                    channel = int(match.group(2))
+                    target = int(match.group(3))
+                    lun = int(match.group(4))
+                    vendor = match.group(5)
+                    model = match.group(6)
+                    dev_path = match.group(8)
+                    
+                    scsi_addr = f"{host}:{channel}:{target}:{lun}"
+                    disk_devices.append({
+                        'scsi_addr': scsi_addr,
+                        'host': host,
+                        'channel': channel,
+                        'target': target,
+                        'lun': lun,
+                        'vendor': vendor,
+                        'model': model,
+                        'dev_path': dev_path,
+                        'sg_dev': sg_dev
+                    })
         
-        debug_print(f"JBOD {controller_dev}: Found {len(targets_found)} targets on host {controller_index}")
+        debug_print(f"JBOD {controller_dev}: Found {len(disk_devices)} total disk devices in system")
         
-        # Now scan each target we found
-        for channel, target, lun in sorted(targets_found):
-            scsi_addr = f"{controller_index}:{channel}:{target}:{lun}"
+        # For JBOD, we can't easily determine which disks belong to which enclosure
+        # without additional enclosure services queries. For now, let's try to
+        # identify disks by looking for ones that don't respond to megaraid commands
+        # and match the vendor/model patterns typical of JBOD drives.
+        
+        jbod_candidate_count = 0
+        for disk in disk_devices:
+            dev_path = disk['dev_path']
+            sg_dev = disk.get('sg_dev', 'N/A')
             
-            # Find the /dev/sg device for this SCSI address
-            sg_device = None
-            for line in lsscsi_output.splitlines():
-                if f"[{scsi_addr}]" in line and '/dev/sg' in line:
-                    match = re.search(r'/dev/sg\d+', line)
-                    if match:
-                        sg_device = match.group(0)
-                        break
+            # Try to query the device directly using the block device (not via megaraid)
+            debug_print(f"JBOD scan: Checking {dev_path} ({disk['scsi_addr']}) sg={sg_dev}")
             
-            if not sg_device:
-                continue
-            
-            # Query this drive directly (not through megaraid passthrough)
-            info = run_command(["smartctl", "-j", "-a", sg_device], is_json=True, silent=True)
+            info = run_command(["smartctl", "-j", "-a", dev_path], is_json=True, silent=True)
             
             if info and 'serial_number' in info:
                 serial = info['serial_number']
                 
+                # Skip duplicates
                 if serial in seen_serials:
+                    debug_print(f"  {dev_path}: Serial {serial} already seen, skipping")
                     continue
                 
-                seen_serials.add(serial)
-                
+                # Check if this looks like a direct-attached JBOD drive
+                # JBOD drives typically show up with vendor/model info
                 model = info.get('model_name', info.get('model_family', 'Unknown'))
-                vendor = info.get('vendor', '')
+                vendor = info.get('vendor', disk['vendor'])
+                
+                # Skip if this is a MegaRAID virtual drive or controller device
+                if 'megaraid' in model.lower() or 'perc' in model.lower():
+                    debug_print(f"  {dev_path}: Skipping MegaRAID/PERC virtual device")
+                    continue
                 
                 if not vendor and model:
                     vendor_match = re.match(r'^(\w+)', model)
@@ -314,22 +483,28 @@ class OSDMonitor:
                     if isinstance(size_info, dict) and 'bytes' in size_info:
                         size = self.format_size_bytes(size_info['bytes'])
                 
+                seen_serials.add(serial)
+                jbod_candidate_count += 1
+                
                 drives[serial] = {
-                    'phy_id': target,  # Use target ID as PHY
+                    'phy_id': disk['target'],  # Use target ID as PHY
                     'serial': serial,
                     'model': model,
                     'vendor': vendor,
                     'health_hw': 'OK' if health_passed else 'FAIL',
                     'smart_details': smart_details,
                     'current_device': None,
-                    'scsi_address': scsi_addr,
+                    'scsi_address': disk['scsi_addr'],
                     'size': size,
                     'controller': controller_type,
                     'controller_device': controller_dev,
                 }
                 
-                debug_print(f"Controller {controller_dev} PHY {target}: {model} S/N:{serial} SCSI:{scsi_addr} Size:{size or 'N/A'}")
+                debug_print(f"  ✓ {dev_path} PHY {disk['target']}: {model} S/N:{serial} SCSI:{disk['scsi_addr']} Size:{size or 'N/A'}")
+            else:
+                debug_print(f"  {dev_path}: No SMART data available")
         
+        debug_print(f"JBOD {controller_dev}: Found {len(drives)} drives (from {jbod_candidate_count} candidates)")
         return drives
     
     def scan_physical_drives(self, progress_callback=None):
@@ -358,7 +533,7 @@ class OSDMonitor:
             
             debug_print(f"Scanning controller {controller_dev} ({controller_type})")
             
-            # JBOD enclosures need special handling
+            # JBOD/Direct enclosures - scan all lsscsi disks not from MegaRAID
             if not is_megaraid:
                 jbod_drives = self.scan_jbod_enclosure(controller, seen_serials)
                 drives.update(jbod_drives)
@@ -626,6 +801,33 @@ class OSDMonitor:
 
         return systemd_status
     
+    def _add_enclosure_info_to_drives(self):
+        """
+        Add enclosure bay/slot information to drive data.
+        Uses the SES enclosure mapping to determine physical slot numbers.
+        """
+        if not self.enclosures:
+            return
+        
+        for serial, drive in self.drives.items():
+            scsi_addr = drive.get('scsi_address')
+            if not scsi_addr:
+                continue
+            
+            # Extract host from SCSI address
+            host = int(scsi_addr.split(':')[0])
+            
+            # Check if we have enclosure info for this host
+            if host in self.enclosures:
+                enclosure = self.enclosures[host]
+                
+                # Look up the physical slot/bay for this SCSI address
+                if scsi_addr in enclosure['slots']:
+                    drive['enclosure_slot'] = enclosure['slots'][scsi_addr]
+                    drive['enclosure_name'] = enclosure['name']
+                    drive['enclosure_device'] = enclosure['device']
+                    debug_print(f"Drive {serial}: Physical bay/slot {drive['enclosure_slot']} in {enclosure['name']}")
+    
     def scan(self, progress_callback=None):
         """
         Complete scan of all drives and OSDs.
@@ -641,6 +843,9 @@ class OSDMonitor:
         # Find all controllers
         self.controllers = self.find_raid_controllers()
         
+        # Find SES enclosures for bay mapping and LED control
+        self.enclosures = self.find_ses_enclosures()
+        
         # Build controller info summary
         self.controller_info = {
             'count': len(self.controllers),
@@ -655,6 +860,9 @@ class OSDMonitor:
         # Map to devices
         self.drives = self.map_drives_to_devices(self.drives)
         
+        # Add enclosure bay/slot info to drives
+        self._add_enclosure_info_to_drives()
+        
         # Get Ceph data
         self.osds = self.get_ceph_osds()
         if not self.osds:
@@ -668,6 +876,7 @@ class OSDMonitor:
         return {
             'timestamp': self.scan_timestamp,
             'controller': self.controller_info,
+            'enclosures': self.enclosures,
             'drives': self.drives,
             'osds': self.osds,
             'osd_to_drive': self.osd_to_drive,
