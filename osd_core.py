@@ -15,7 +15,7 @@ Usage:
     # data contains all drive information
 """
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 import subprocess
 import json
@@ -195,10 +195,11 @@ class OSDMonitor:
         
         for line in lsscsi_output.splitlines():
             if 'enclosu' in line.lower():
-                # Parse: [7:0:7:0]   enclosu DELL     MD1400           1.07  /dev/sg10
-                match = re.match(r'\[(\d+):(\d+):(\d+):(\d+)\]\s+enclosu\s+(\S+)\s+(\S+)\s+(\S+)\s+(/dev/sg\d+)', line)
+                # Parse: [7:0:7:0]   enclosu DELL     MD1400           1.07  -          /dev/sg10
+                # Note: The dash is where a block device would be for a disk
+                match = re.match(r'\[(\d+):(\d+):(\d+):(\d+)\]\s+enclosu\s+(\S+)\s+(\S+)\s+(\S+)\s+\S+\s+(/dev/sg\d+)', line)
                 if not match:
-                    # Try without sg device
+                    # Try without the dash and sg device
                     match = re.match(r'\[(\d+):(\d+):(\d+):(\d+)\]\s+enclosu\s+(\S+)\s+(\S+)', line)
                 
                 if match:
@@ -228,33 +229,52 @@ class OSDMonitor:
         """
         sg_dev = enclosure['device']
         
+        debug_print(f"  Querying SES data from {sg_dev}...")
+        
         # Run sg_ses to get slot information
         # sg_ses output format varies, so we'll try to parse it
         ses_output = run_command(["sg_ses", sg_dev], is_json=False, silent=True)
         
         if not ses_output:
-            debug_print(f"  Could not query SES info from {sg_dev}")
+            debug_print(f"  ⚠ Could not query SES info from {sg_dev} - sg_ses may not be installed")
+            debug_print(f"  Install with: apt install sg3-utils")
             return
         
+        debug_print(f"  Successfully queried {sg_dev}, parsing slot mappings...")
+        
         # Parse sg_ses output to find array devices and their slots
-        # This is enclosure-specific, but MD1400 typically shows:
-        # "Element index: X, [SCSI address: Y:Z:W:L]"
+        # Different enclosures format this differently, so we try multiple patterns
+        
+        # Method 1: Look for "Element index: X" followed by SCSI address
         current_slot = None
+        slots_found = 0
         for line in ses_output.splitlines():
             # Look for element index (slot number)
-            if 'Element index:' in line:
-                match = re.search(r'Element index:\s*(\d+)', line)
+            if 'Element index:' in line or 'element index:' in line.lower():
+                match = re.search(r'[Ee]lement index:\s*(\d+)', line)
                 if match:
                     current_slot = int(match.group(1))
             
-            # Look for SCSI address association
-            if current_slot is not None and 'SCSI address:' in line:
-                match = re.search(r'SCSI address:\s*(\d+):(\d+):(\d+):(\d+)', line)
+            # Look for SCSI address association (multiple formats)
+            if current_slot is not None:
+                # Format 1: "SCSI address: H:C:T:L"
+                match = re.search(r'SCSI address:\s*(\d+):(\d+):(\d+):(\d+)', line, re.IGNORECASE)
+                if not match:
+                    # Format 2: "[H:C:T:L]"
+                    match = re.search(r'\[(\d+):(\d+):(\d+):(\d+)\]', line)
+                
                 if match:
                     scsi_addr = f"{match.group(1)}:{match.group(2)}:{match.group(3)}:{match.group(4)}"
                     enclosure['slots'][scsi_addr] = current_slot
-                    debug_print(f"  Slot {current_slot} -> SCSI {scsi_addr}")
+                    debug_print(f"    Bay/Slot {current_slot} -> SCSI {scsi_addr}")
+                    slots_found += 1
                     current_slot = None
+        
+        if slots_found == 0:
+            debug_print(f"  ⚠ No slot mappings found in SES output")
+            debug_print(f"  This enclosure may not support slot->SCSI mapping via SES")
+        else:
+            debug_print(f"  ✓ Mapped {slots_found} drive slots")
     
     @staticmethod
     def locate_drive_on(device_path):
