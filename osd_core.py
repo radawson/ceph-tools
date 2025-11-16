@@ -70,45 +70,86 @@ class OSDMonitor:
         self.scan_timestamp = None
     
     def find_raid_controllers(self):
-        """Find ALL RAID controller devices."""
+        """Find ALL RAID controllers and JBOD enclosures."""
         debug_print("Looking for RAID controller(s)...")
         controllers = []
+        seen_serials = set()  # Track controller serials to avoid duplicates
         
-        for i in range(20):
+        # Scan wider range to catch JBOD enclosures (like MD1400 at sg24)
+        for i in range(30):
             sg_dev = f"/dev/sg{i}"
             if os.path.exists(sg_dev):
                 info = run_command(["smartctl", "-i", sg_dev], is_json=False, silent=True)
-                if info and ('megaraid' in info.lower() or 'raid' in info.lower() or 'perc' in info.lower()):
-                    # Try to get more details about the controller
+                
+                if not info:
+                    continue
+                
+                info_lower = info.lower()
+                
+                # Check if this is a controller/enclosure we want to track
+                is_raid = 'megaraid' in info_lower or 'raid' in info_lower or 'perc' in info_lower
+                is_jbod = 'md1400' in info_lower or 'md1200' in info_lower or 'jbod' in info_lower
+                is_enclosure = 'enclosure' in info_lower
+                
+                if is_raid or is_jbod or is_enclosure:
                     controller_type = 'Unknown'
                     controller_model = 'Unknown'
+                    controller_serial = None
+                    is_megaraid_type = False
                     
                     for line in info.split('\n'):
                         line_lower = line.lower()
                         if 'product' in line_lower or 'device model' in line_lower:
-                            # Extract model name
                             if ':' in line:
                                 model = line.split(':', 1)[1].strip()
                                 controller_model = model
+                                
+                                # Check for JBOD/SAS expander enclosures
+                                if 'md1400' in model.lower():
+                                    controller_type = 'MD1400 JBOD'
+                                    is_megaraid_type = False
+                                elif 'md1200' in model.lower():
+                                    controller_type = 'MD1200 JBOD'
+                                    is_megaraid_type = False
                                 # Identify specific Dell PERC models
-                                if 'h730' in model.lower():
+                                elif 'h730' in model.lower():
                                     controller_type = 'PERC H730'
+                                    is_megaraid_type = True
                                 elif 'h830' in model.lower():
                                     controller_type = 'PERC H830'
+                                    is_megaraid_type = True
                                 elif 'h740' in model.lower():
                                     controller_type = 'PERC H740'
+                                    is_megaraid_type = True
                                 elif 'h840' in model.lower():
                                     controller_type = 'PERC H840'
+                                    is_megaraid_type = True
                                 elif 'perc' in model.lower():
                                     controller_type = 'PERC'
+                                    is_megaraid_type = True
                                 elif 'megaraid' in model.lower() or 'lsi' in model.lower():
-                                    controller_type = 'MegaRAID'
+                                    controller_type = 'MegaRAID/LSI'
+                                    is_megaraid_type = True
+                        
+                        elif 'serial number' in line_lower:
+                            if ':' in line:
+                                controller_serial = line.split(':', 1)[1].strip()
+                    
+                    # Skip duplicate controllers (same serial = same physical controller)
+                    if controller_serial and controller_serial in seen_serials:
+                        debug_print(f"{sg_dev}: Duplicate controller with S/N {controller_serial}, skipping")
+                        continue
+                    
+                    if controller_serial:
+                        seen_serials.add(controller_serial)
                     
                     controllers.append({
                         'device': sg_dev,
                         'type': controller_type,
                         'model': controller_model,
-                        'index': i
+                        'index': i,
+                        'is_megaraid': is_megaraid_type,
+                        'serial': controller_serial
                     })
                     debug_print(f"Found RAID controller at {sg_dev}: {controller_type} ({controller_model})")
         
@@ -196,6 +237,101 @@ class OSDMonitor:
         else:
             return f"{size_bytes / 1e6:.0f}M"
     
+    def scan_jbod_enclosure(self, controller, seen_serials):
+        """
+        Scan a JBOD enclosure by finding its SCSI host and enumerating targets.
+        
+        Returns:
+            dict: drives found in this enclosure
+        """
+        drives = {}
+        controller_dev = controller['device']
+        controller_type = controller['type']
+        controller_index = controller['index']
+        
+        # Get the SCSI host number from lsscsi
+        lsscsi_output = run_command(["lsscsi"], is_json=False, silent=True)
+        if not lsscsi_output:
+            return drives
+        
+        # Find all SCSI addresses for this host (controller_index)
+        # Looking for pattern: [24:0:26:0] for drives on host 24
+        targets_found = set()
+        for line in lsscsi_output.splitlines():
+            match = re.match(r'\[(\d+):(\d+):(\d+):(\d+)\]', line)
+            if match:
+                host = int(match.group(1))
+                channel = int(match.group(2))
+                target = int(match.group(3))
+                lun = int(match.group(4))
+                
+                if host == controller_index:
+                    targets_found.add((channel, target, lun))
+        
+        debug_print(f"JBOD {controller_dev}: Found {len(targets_found)} targets on host {controller_index}")
+        
+        # Now scan each target we found
+        for channel, target, lun in sorted(targets_found):
+            scsi_addr = f"{controller_index}:{channel}:{target}:{lun}"
+            
+            # Find the /dev/sg device for this SCSI address
+            sg_device = None
+            for line in lsscsi_output.splitlines():
+                if f"[{scsi_addr}]" in line and '/dev/sg' in line:
+                    match = re.search(r'/dev/sg\d+', line)
+                    if match:
+                        sg_device = match.group(0)
+                        break
+            
+            if not sg_device:
+                continue
+            
+            # Query this drive directly (not through megaraid passthrough)
+            info = run_command(["smartctl", "-j", "-a", sg_device], is_json=True, silent=True)
+            
+            if info and 'serial_number' in info:
+                serial = info['serial_number']
+                
+                if serial in seen_serials:
+                    continue
+                
+                seen_serials.add(serial)
+                
+                model = info.get('model_name', info.get('model_family', 'Unknown'))
+                vendor = info.get('vendor', '')
+                
+                if not vendor and model:
+                    vendor_match = re.match(r'^(\w+)', model)
+                    if vendor_match:
+                        vendor = vendor_match.group(1)
+                
+                health_passed = info.get('smart_status', {}).get('passed', False)
+                smart_details = self.extract_smart_details(info)
+                
+                size = None
+                if 'user_capacity' in info:
+                    size_info = info['user_capacity']
+                    if isinstance(size_info, dict) and 'bytes' in size_info:
+                        size = self.format_size_bytes(size_info['bytes'])
+                
+                drives[serial] = {
+                    'phy_id': target,  # Use target ID as PHY
+                    'serial': serial,
+                    'model': model,
+                    'vendor': vendor,
+                    'health_hw': 'OK' if health_passed else 'FAIL',
+                    'smart_details': smart_details,
+                    'current_device': None,
+                    'scsi_address': scsi_addr,
+                    'size': size,
+                    'controller': controller_type,
+                    'controller_device': controller_dev,
+                }
+                
+                debug_print(f"Controller {controller_dev} PHY {target}: {model} S/N:{serial} SCSI:{scsi_addr} Size:{size or 'N/A'}")
+        
+        return drives
+    
     def scan_physical_drives(self, progress_callback=None):
         """
         Scan ALL RAID controllers for physical drives.
@@ -218,9 +354,17 @@ class OSDMonitor:
             controller_dev = controller['device']
             controller_type = controller['type']
             controller_index = controller['index']
+            is_megaraid = controller.get('is_megaraid', True)
             
             debug_print(f"Scanning controller {controller_dev} ({controller_type})")
             
+            # JBOD enclosures need special handling
+            if not is_megaraid:
+                jbod_drives = self.scan_jbod_enclosure(controller, seen_serials)
+                drives.update(jbod_drives)
+                continue
+            
+            # For MegaRAID controllers, use the megaraid passthrough
             for phy_id in range(slots_per_controller):
                 if progress_callback:
                     progress_callback(current_slot, total_slots, 
