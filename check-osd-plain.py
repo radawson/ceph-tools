@@ -11,7 +11,7 @@ Usage:
     sudo python3 check-osd-plain.py --export-json
 """
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 import sys
 import os
