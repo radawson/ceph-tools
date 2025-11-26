@@ -29,8 +29,8 @@ if [ -z "${1:-}" ] || [ -z "${2:-}" ] || [ -z "${3:-}" ]; then
 fi
 
 # Validate source and destination exist
-SRC="/dev/disk/by-id/scsi-$1"
-DST="/dev/disk/by-id/scsi-$2"
+SRC="/dev/disk/by-id/$1"
+DST="/dev/disk/by-id/$2"
 
 if [ ! -b "$SRC" ]; then
     echo "Error: Source device $SRC does not exist or is not a block device."
