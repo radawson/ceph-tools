@@ -41,6 +41,13 @@ echo ">> Source device: $REALDEV"
 echo ">> RBD image name: $IMG"
 echo ">> ddrescue log: $LOG"
 
+# Safety check: prevent overwriting existing non-empty log unless resuming
+if [ -f "$LOG" ] && [ -s "$LOG" ] && [ "$RESUME_MODE" != "resume" ]; then
+    echo "Error: Log file $LOG already exists and is not empty."
+    echo "To resume, run with 'resume' as second argument: $0 $ARG resume"
+    exit 1
+fi
+
 # Determine size of source block device (in bytes for precision, then MB)
 SIZE_BYTES=$(blockdev --getsize64 "$REALDEV")
 SIZE_MB=$(( (SIZE_BYTES + 1048575) / 1048576 ))  # Round up slightly for safety
