@@ -7,10 +7,47 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DRIVEORDER_FILE="${SCRIPT_DIR}/driveorder.txt"
+SUMMARY_FILE="${SCRIPT_DIR}/ntfs-alignment-summary-$(date +%Y%m%d-%H%M%S).txt"
 
-# Parse arguments
-MODE="${1:-}"
-STRIPE_SIZE="${2:-65536}"  # Default 64KB, common for Dell PERC830
+# Parse arguments - simple approach
+ARG1="${1:-}"
+ARG2="${2:-}"
+
+# Default stripe size
+STRIPE_SIZE="65536"  # Default 64KB, common for Dell PERC830
+
+# Determine mode: check if first argument is a device or RBD, otherwise assume it's a filename
+if [ -z "$ARG1" ] || [ "$ARG1" = "--file" ]; then
+    # No argument or explicit --file: use default file
+    MODE="--file"
+    # ARG2 might be stripe size
+    if [ -n "$ARG2" ] && [[ "$ARG2" =~ ^[0-9]+$ ]] && [ "$ARG2" -gt 0 ]; then
+        STRIPE_SIZE="$ARG2"
+    fi
+elif [[ "$ARG1" =~ ^/dev/ ]] || [[ "$ARG1" =~ ^rbd[[:space:]]+ ]]; then
+    # First argument is a device path or RBD: single device mode
+    MODE="$ARG1"
+    # ARG2 might be stripe size
+    if [ -n "$ARG2" ] && [[ "$ARG2" =~ ^[0-9]+$ ]] && [ "$ARG2" -gt 0 ]; then
+        STRIPE_SIZE="$ARG2"
+    fi
+else
+    # First argument is not a device: assume it's a filename
+    MODE="--file"
+    # Resolve file path (try multiple locations)
+    if [ -f "$ARG1" ]; then
+        DRIVEORDER_FILE="$ARG1"
+    elif [ -f "${SCRIPT_DIR}/${ARG1}" ]; then
+        DRIVEORDER_FILE="${SCRIPT_DIR}/${ARG1}"
+    else
+        echo "Error: File not found: $ARG1"
+        exit 1
+    fi
+    # ARG2 might be stripe size
+    if [ -n "$ARG2" ] && [[ "$ARG2" =~ ^[0-9]+$ ]] && [ "$ARG2" -gt 0 ]; then
+        STRIPE_SIZE="$ARG2"
+    fi
+fi
 
 # Validate stripe size is a positive integer
 if ! [[ "$STRIPE_SIZE" =~ ^[0-9]+$ ]] || [ "$STRIPE_SIZE" -le 0 ]; then
@@ -25,8 +62,8 @@ map_rbd_device() {
     local rbd_spec="$1"
     local pool image
     
-    # Parse "rbd pool/image" or "rbd pool//image"
-    if [[ "$rbd_spec" =~ ^rbd[[:space:]]+([^/]+)//?(.+)$ ]]; then
+    # Parse "rbd pool/image" or "rbd pool//image" (handles both single and double slash)
+    if [[ "$rbd_spec" =~ ^rbd[[:space:]]+([^/]+)/+(.+)$ ]]; then
         pool="${BASH_REMATCH[1]}"
         image="${BASH_REMATCH[2]}"
     else
@@ -90,13 +127,51 @@ resolve_device() {
     return 1
 }
 
+# Function to write summary header to file
+write_summary_header() {
+    {
+        echo "=========================================="
+        echo "NTFS Alignment Check Summary"
+        echo "=========================================="
+        echo "Generated: $(date)"
+        echo "Stripe Size: $STRIPE_SIZE bytes ($((STRIPE_SIZE / 1024))KB)"
+        echo ""
+    } >> "$SUMMARY_FILE"
+}
+
+# Function to append device result to summary file
+append_summary_result() {
+    local device_label="$1"
+    local device_path="$2"
+    local patterns_found="$3"
+    local status="$4"
+    
+    {
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "Device: $device_label"
+        echo "Path: $device_path"
+        echo "NTFS Patterns Found: $patterns_found"
+        echo "Status: $status"
+        echo ""
+    } >> "$SUMMARY_FILE"
+}
+
+# NTFS boot sector signature patterns (global)
+# Full signature: EB 52 90 4E 54 46 53 20 20 20 20
+# At offset 0x03: "NTFS    " (4E 54 46 53 20 20 20 20)
+NTFS_SIG_OFFSET_0x03="4E54465320202020"  # "NTFS    " at offset 0x03
+NTFS_SIG_FULL="EB52904E54465320202020"    # Full boot sector signature
+
 # Function to check a single device
 check_device() {
     local DEVICE="$1"
     local device_label="$2"
+    local summary_patterns=0
+    local summary_status=""
     
     if [ ! -b "$DEVICE" ]; then
         echo "Error: $DEVICE is not a valid block device."
+        append_summary_result "$device_label" "$DEVICE" "ERROR" "Device not accessible"
         return 1
     fi
 
@@ -109,12 +184,6 @@ check_device() {
     echo "Stripe Size: $STRIPE_SIZE bytes ($((STRIPE_SIZE / 1024))KB)"
     echo "Mode: READ-ONLY (non-destructive)"
     echo ""
-
-# NTFS boot sector signature patterns
-# Full signature: EB 52 90 4E 54 46 53 20 20 20 20
-# At offset 0x03: "NTFS    " (4E 54 46 53 20 20 20 20)
-NTFS_SIG_OFFSET_0x03="4E54465320202020"  # "NTFS    " at offset 0x03
-NTFS_SIG_FULL="EB52904E54465320202020"    # Full boot sector signature
 
 # Function to check for NTFS signature at a specific offset
 check_ntfs_at_offset() {
@@ -239,7 +308,8 @@ echo ""
 echo "=========================================="
 echo "Summary"
 echo "=========================================="
-echo "Device: $DEVICE"
+echo "Device Label: $device_label"
+echo "Device Path: $DEVICE"
 echo "Stripe Size: $STRIPE_SIZE bytes"
 echo "NTFS Patterns Found: $FOUND_PATTERNS"
 echo ""
@@ -249,6 +319,7 @@ if [ "$FOUND_PATTERNS" -gt 0 ]; then
     echo "   This suggests it may be the CORRECT first data member."
     echo "   The patterns are shifted by the stripe size, which is expected"
     echo "   for RAID6 members containing NTFS data."
+    summary_status="✅ LIKELY CORRECT - NTFS patterns found at stripe offsets"
 else
     echo "❌ No NTFS patterns found at any stripe offset."
     echo "   This device appears random at all checked offsets."
@@ -256,24 +327,40 @@ else
     echo "   - A parity disk"
     echo "   - An incorrectly ordered data member"
     echo "   - A disk from a different array"
+    summary_status="❌ NO PATTERNS - Appears random (parity/incorrect order?)"
 fi
 
     echo ""
     echo "Note: This is a READ-ONLY check. No data was modified."
     echo ""
+    
+    # Store result for summary
+    append_summary_result "$device_label" "$DEVICE" "$FOUND_PATTERNS" "$summary_status"
 }
 
 # Main execution
-if [ -z "$MODE" ] || [ "$MODE" = "--help" ] || [ "$MODE" = "-h" ]; then
-    echo "Usage: $0 [device|--file] [stripe_size_bytes]"
+if [ "$MODE" = "--help" ] || [ "$MODE" = "-h" ]; then
+    echo "Usage: $0 [device|filename] [stripe_size]"
     echo ""
     echo "Modes:"
-    echo "  <device>          Check a single device (e.g., /dev/sda)"
-    echo "  --file            Check all devices listed in driveorder.txt"
-    echo "  (no args)         Same as --file"
+    echo "  <device>          Check a single device (e.g., /dev/sda or rbd pool/image)"
+    echo "                    Usage: $0 <device> [stripe_size]"
+    echo ""
+    echo "  <filename>       Check all devices listed in file"
+    echo "                    Usage: $0 <filename> [stripe_size]"
+    echo ""
+    echo "  (no args)        Check all devices in driveorder.txt"
     echo ""
     echo "Options:"
-    echo "  stripe_size_bytes: Stripe size in bytes (default: 65536 = 64KB)"
+    echo "  stripe_size      Stripe size in bytes (default: 65536 = 64KB)"
+    echo ""
+    echo "Examples:"
+    echo "  $0                                    # Check all in driveorder.txt"
+    echo "  $0 driveorder.txt                     # Check all in specified file"
+    echo "  $0 driveorder.txt 131072               # Use custom file + stripe size"
+    echo "  $0 /dev/sda                           # Check single device"
+    echo "  $0 /dev/sda 131072                    # Single device with stripe size"
+    echo "  $0 rbd filestore_raw/image            # Check RBD device"
     echo ""
     echo "Common stripe sizes:"
     echo "  65536  = 64KB (default)"
@@ -294,11 +381,15 @@ if [ "$MODE" = "--file" ] || [ -z "$MODE" ]; then
         exit 1
     fi
     
+    # Initialize summary file
+    write_summary_header
+    
     echo "=========================================="
     echo "Batch NTFS Alignment Check"
     echo "=========================================="
     echo "Reading devices from: $DRIVEORDER_FILE"
     echo "Stripe Size: $STRIPE_SIZE bytes ($((STRIPE_SIZE / 1024))KB)"
+    echo "Summary file: $SUMMARY_FILE"
     echo ""
     
     DEVICE_COUNT=0
@@ -359,6 +450,17 @@ if [ "$MODE" = "--file" ] || [ -z "$MODE" ]; then
     echo "=========================================="
     echo "Processed $DEVICE_COUNT device(s)"
     echo ""
+    echo "Summary saved to: $SUMMARY_FILE"
+    echo ""
+    
+    # Write final summary footer
+    {
+        echo "=========================================="
+        echo "End of Summary"
+        echo "=========================================="
+        echo "Total devices processed: $DEVICE_COUNT"
+        echo ""
+    } >> "$SUMMARY_FILE"
     
 else
     # Single device mode
@@ -369,11 +471,17 @@ else
         exit 1
     fi
     
+    # Initialize summary file for single device mode
+    write_summary_header
+    
     # Track if we mapped an RBD device for cleanup
     MAPPED_RBD=false
     if [[ "$MODE" =~ ^rbd[[:space:]]+ ]]; then
         MAPPED_RBD=true
     fi
+    
+    echo "Summary file: $SUMMARY_FILE"
+    echo ""
     
     # Check the device
     check_device "$DEVICE" "$MODE"
@@ -386,4 +494,8 @@ else
             rbd unmap "$DEVICE" 2>/dev/null || true
         fi
     fi
+    
+    echo ""
+    echo "Summary saved to: $SUMMARY_FILE"
+    echo ""
 fi
